@@ -1,0 +1,16 @@
+{"ts":"2026-07-27T09:14:02Z","level":"info","msg":"server listening","addr":"0.0.0.0:8080"}
+{"ts":"2026-07-27T09:14:07Z","level":"info","msg":"GET /healthz","duration_ms":2,"http":{"status":200},"user":{"id":0}}
+{"ts":"2026-07-27T09:14:11Z","level":"info","msg":"GET /api/orders","duration_ms":48,"http":{"status":200},"user":{"id":1042}}
+{"ts":"2026-07-27T09:14:12Z","level":"warn","msg":"slow query","duration_ms":812,"query":"SELECT * FROM orders","user":{"id":1042}}
+{"ts":"2026-07-27T09:14:15Z","level":"error","msg":"upstream timeout","duration_ms":3001,"http":{"status":504},"user":{"id":1042},"upstream":"billing"}
+level=info msg="GET /healthz" duration_ms=1 status=200
+level=info msg="POST /api/orders" duration_ms=134 status=201 user_id=88
+{"ts":"2026-07-27T09:14:23Z","level":"error","msg":"connection reset by peer","duration_ms":15,"http":{"status":502},"upstream":"search"}
+this line is not structured at all
+{"ts":"2026-07-27T09:14:31Z","level":"debug","msg":"cache hit","key":"orders:1042","duration_ms":0}
+level=warn msg="disk 82% full" device=/dev/sda1 free_bytes=1288490188
+{"ts":"2026-07-27T09:14:44Z","level":"error","msg":"upstream timeout","duration_ms":3002,"http":{"status":504},"user":{"id":88},"upstream":"billing"}
+{"ts":"2026-07-27T09:14:50Z","level":"info","msg":"GET /api/orders","duration_ms":61,"http":{"status":200},"user":{"id":88}}
+{"ts":"2026-07-27T09:15:02Z","level":"error","msg":"payment declined","duration_ms":220,"http":{"status":402},"user":{"id":1042},"err":null}
+level=info msg="request served" duration_ms=250 status=200 cached
+{"ts":"2026-07-27T09:15:19Z","level":"fatal","msg":"out of memory","rss_bytes":2147483648}
