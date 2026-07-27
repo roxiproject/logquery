@@ -12,7 +12,9 @@ categories = ["command-line-utilities"]
 [dependencies]
 # Parsing JSON Lines records. Writing a correct JSON parser is not the point of
 # this project, and serde_json is the de-facto standard.
-serde_json = "1"
+# `preserve_order` keeps record fields in the order the log emitter wrote them,
+# which is what `select *` should print.
+serde_json = { version = "1", features = ["preserve_order"] }
 # Error context propagation for the I/O layer.
 anyhow = "1"
 
