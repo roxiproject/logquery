@@ -197,9 +197,7 @@ mod tests {
     fn where_filters_records() {
         let rows = run(r#"select msg where level = "error""#, LOG);
         assert_eq!(rows.len(), 3);
-        assert!(rows
-            .iter()
-            .all(|r| r["msg"].as_str().unwrap().len() > 0));
+        assert!(rows.iter().all(|r| !r["msg"].as_str().unwrap().is_empty()));
     }
 
     #[test]

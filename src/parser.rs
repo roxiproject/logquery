@@ -35,8 +35,10 @@ pub fn parse(query: &str) -> Result<Query, QueryError> {
     Ok(q)
 }
 
-/// Parse just an expression. Used by tests and by anything that wants a bare
-/// filter without the surrounding `select`.
+/// Parse a bare filter expression, without the surrounding `select`. The
+/// binary always goes through [`parse`]; this entry point exists so the
+/// expression grammar and evaluator can be exercised in isolation.
+#[cfg(test)]
 pub fn parse_expr(src: &str) -> Result<Expr, QueryError> {
     let tokens = tokenize(src)?;
     let mut p = Parser {
