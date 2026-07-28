@@ -65,6 +65,8 @@ pub enum CmpOp {
 pub enum Literal {
     Str(String),
     Num(f64),
+    /// A duration literal such as `15m`, already converted to seconds.
+    Duration(f64),
     Bool(bool),
     Null,
 }
@@ -189,12 +191,38 @@ impl Func {
     }
 }
 
-/// Something that produces a value: a field, a literal, or a call.
+/// Addition and subtraction over values. Multiplication and division are
+/// deliberately absent: `*` already means "every field" in a select list, and
+/// nothing a log query asks for needs them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+}
+
+impl ArithOp {
+    pub fn symbol(self) -> char {
+        match self {
+            ArithOp::Add => '+',
+            ArithOp::Sub => '-',
+        }
+    }
+}
+
+/// Something that produces a value: a field, a literal, a call, or a sum.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValueExpr {
     Field(Path),
     Lit(Literal),
-    Call { func: Func, args: Vec<ValueExpr> },
+    Call {
+        func: Func,
+        args: Vec<ValueExpr>,
+    },
+    Arith {
+        op: ArithOp,
+        left: Box<ValueExpr>,
+        right: Box<ValueExpr>,
+    },
 }
 
 impl fmt::Display for ValueExpr {
@@ -215,6 +243,16 @@ impl fmt::Display for ValueExpr {
                 }
                 write!(f, ")")
             }
+            ValueExpr::Arith { op, left, right } => {
+                write!(f, "{left} {} ", op.symbol())?;
+                // `a - (b - c)` differs from `a - b - c`, so a nested sum on
+                // the right keeps the parentheses that were written.
+                if matches!(**right, ValueExpr::Arith { .. }) {
+                    write!(f, "({right})")
+                } else {
+                    write!(f, "{right}")
+                }
+            }
         }
     }
 }
@@ -224,6 +262,7 @@ impl fmt::Display for Literal {
         match self {
             Literal::Str(s) => write!(f, "\"{s}\""),
             Literal::Num(n) => write!(f, "{n}"),
+            Literal::Duration(secs) => write!(f, "{secs}s"),
             Literal::Bool(b) => write!(f, "{b}"),
             Literal::Null => write!(f, "null"),
         }

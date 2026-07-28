@@ -37,7 +37,7 @@ use std::cmp::Ordering;
 
 use serde_json::Value;
 
-use crate::ast::{CmpOp, Expr, Func, Literal, ValueExpr};
+use crate::ast::{ArithOp, CmpOp, Expr, Func, Literal, ValueExpr};
 use crate::record::{lookup, Record};
 use crate::timeutil;
 
@@ -69,13 +69,33 @@ fn resolve<'a>(expr: &'a ValueExpr, record: &'a Record) -> Resolved<'a> {
         },
         ValueExpr::Lit(lit) => Resolved::Owned(literal_value(lit)),
         ValueExpr::Call { func, args } => call(*func, args, record),
+        ValueExpr::Arith { op, left, right } => arith(*op, left, right, record),
     }
+}
+
+/// Add or subtract two values. Both sides are cast to numbers the way `num`
+/// casts them, so `ts(t) > now() - 15m` works whether the log wrote its
+/// timestamp as a number or as text. A side that is not numeric is missing,
+/// and missing propagates.
+fn arith<'a>(op: ArithOp, left: &ValueExpr, right: &ValueExpr, record: &Record) -> Resolved<'a> {
+    let (Some(a), Some(b)) = (
+        resolve(left, record).value().and_then(to_number),
+        resolve(right, record).value().and_then(to_number),
+    ) else {
+        return Resolved::Missing;
+    };
+    Resolved::Owned(number(match op {
+        ArithOp::Add => a + b,
+        ArithOp::Sub => a - b,
+    }))
 }
 
 fn literal_value(lit: &Literal) -> Value {
     match lit {
         Literal::Str(s) => Value::String(s.clone()),
         Literal::Num(n) => number(*n),
+        // A duration is a number of seconds; the unit only existed to spell it.
+        Literal::Duration(secs) => number(*secs),
         Literal::Bool(b) => Value::Bool(*b),
         Literal::Null => Value::Null,
     }
@@ -1150,6 +1170,42 @@ mod tests {
         let r = json!({"ts": "2026-07-27T10:00:00Z", "seen": 1785146460});
         assert!(check("ts(seen) > ts(ts)", &r));
         assert!(check("ts(ts) < now()", &r));
+    }
+
+    #[test]
+    fn sums_and_differences_evaluate() {
+        let r = json!({"a": 10, "b": 4, "s": "2.5"});
+        assert_eq!(value("a + b", &r), Some(json!(14.0)));
+        assert_eq!(value("a - b", &r), Some(json!(6.0)));
+        assert_eq!(value("a - b - b", &r), Some(json!(2.0)));
+        assert_eq!(value("a - (b - b)", &r), Some(json!(10.0)));
+        // A numeric string is cast, as `num` casts it.
+        assert_eq!(value("a + s", &r), Some(json!(12.5)));
+    }
+
+    #[test]
+    fn a_duration_literal_is_its_length_in_seconds() {
+        let r = json!({});
+        assert_eq!(value("0 + 15m", &r), Some(json!(900.0)));
+        assert_eq!(value("0 + 1h", &r), Some(json!(3600.0)));
+        assert_eq!(value("0 + 250ms", &r), Some(json!(0.25)));
+    }
+
+    #[test]
+    fn a_recency_window_filters_on_the_clock() {
+        let now = crate::timeutil::now_epoch();
+        let r = json!({"recent": now - 60.0, "old": now - 7200.0});
+        assert!(check("recent > now() - 15m", &r));
+        assert!(!check("old > now() - 15m", &r));
+    }
+
+    #[test]
+    fn arithmetic_on_a_missing_or_non_numeric_side_is_missing() {
+        let r = json!({"a": 1, "text": "error", "nil": null});
+        assert_eq!(value("a + gone", &r), None);
+        assert_eq!(value("gone + a", &r), None);
+        assert_eq!(value("a + text", &r), None);
+        assert_eq!(value("a + nil", &r), None);
     }
 
     #[test]
