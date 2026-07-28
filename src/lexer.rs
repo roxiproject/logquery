@@ -174,7 +174,7 @@ impl<'a> Lexer<'a> {
     fn run(mut self) -> Result<Vec<Token>, QueryError> {
         let mut out = Vec::new();
         loop {
-            self.skip_whitespace();
+            self.skip_ignorable();
             let col = self.col();
             let Some(c) = self.peek() else {
                 out.push(Token {
@@ -258,9 +258,23 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn skip_whitespace(&mut self) {
-        while matches!(self.peek(), Some(c) if c.is_whitespace()) {
-            self.bump();
+    /// Skip whitespace and `--` comments, which run to the end of the line.
+    ///
+    /// A comment is only recognised where a token could start, so the `-` of a
+    /// negative number is never mistaken for one. This is what makes queries
+    /// stored in a file with `-f` readable.
+    fn skip_ignorable(&mut self) {
+        loop {
+            while matches!(self.peek(), Some(c) if c.is_whitespace()) {
+                self.bump();
+            }
+            if self.peek() == Some('-') && self.peek_at(1) == Some('-') {
+                while matches!(self.peek(), Some(c) if c != '\n') {
+                    self.bump();
+                }
+                continue;
+            }
+            return;
         }
     }
 
@@ -559,6 +573,42 @@ mod tests {
     fn bang_without_equals_is_an_error() {
         let err = tokenize("a ! b").unwrap_err();
         assert!(err.message.contains("expected `=`"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_double_dash_comment_runs_to_the_end_of_the_line() {
+        assert_eq!(
+            kinds("select *  -- everything\nlimit 5 -- but not much"),
+            vec![
+                TokenKind::Select,
+                TokenKind::Star,
+                TokenKind::Limit,
+                TokenKind::Num(5.0),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_comment_may_be_the_whole_query_text() {
+        assert_eq!(kinds("-- nothing here"), vec![TokenKind::Eof]);
+        assert_eq!(kinds(""), vec![TokenKind::Eof]);
+    }
+
+    #[test]
+    fn consecutive_comment_lines_are_all_skipped() {
+        assert_eq!(
+            kinds("-- one\n-- two\nselect *"),
+            vec![TokenKind::Select, TokenKind::Star, TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn a_double_dash_inside_a_string_is_not_a_comment() {
+        assert_eq!(
+            kinds(r#""a -- b""#),
+            vec![TokenKind::Str("a -- b".into()), TokenKind::Eof]
+        );
     }
 
     #[test]
