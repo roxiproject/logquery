@@ -180,6 +180,22 @@ fn call<'a>(func: Func, args: &'a [ValueExpr], record: &'a Record) -> Resolved<'
         Func::Trim => as_text(&first).map(|t| Value::String(t.trim().to_string())),
         Func::Abs => to_number(&first).map(|n| number(n.abs())),
         Func::Ts => to_epoch(&first).map(number),
+        Func::Bucket => {
+            let (Some(secs), Some(width)) = (
+                to_epoch(&first),
+                resolve(&args[1], record).value().and_then(to_number),
+            ) else {
+                return Resolved::Missing;
+            };
+            // A window has to have width, and a negative one has no meaning.
+            if !(width > 0.0) {
+                return Resolved::Missing;
+            }
+            // Windows are aligned to the epoch, so the same query over the
+            // same log always cuts at the same instants regardless of when
+            // the first record happened to arrive.
+            Some(number((secs / width).floor() * width))
+        }
         Func::FormatTime => {
             let Some(secs) = to_epoch(&first) else {
                 return Resolved::Missing;
@@ -1214,6 +1230,39 @@ mod tests {
         assert_eq!(value("gone + a", &r), None);
         assert_eq!(value("a + text", &r), None);
         assert_eq!(value("a + nil", &r), None);
+    }
+
+    #[test]
+    fn bucket_floors_a_timestamp_to_a_window() {
+        let r = json!({"ts": "2026-07-27T10:07:31Z", "n": 1785146851});
+        // 10:07:31 falls in the five-minute window starting at 10:05.
+        assert_eq!(
+            value("format_time(bucket(ts, 5m))", &r),
+            Some(json!("2026-07-27T10:05:00Z"))
+        );
+        assert_eq!(
+            value("format_time(bucket(ts, 1h))", &r),
+            Some(json!("2026-07-27T10:00:00Z"))
+        );
+        // An epoch number buckets the same as the text that spells it.
+        assert_eq!(value("bucket(n, 5m)", &r), value("bucket(ts, 5m)", &r));
+    }
+
+    #[test]
+    fn windows_are_aligned_to_the_epoch_not_to_the_first_record() {
+        let a = json!({"ts": "2026-07-27T10:07:31Z"});
+        let b = json!({"ts": "2026-07-27T10:09:59Z"});
+        assert_eq!(value("bucket(ts, 5m)", &a), value("bucket(ts, 5m)", &b));
+        let c = json!({"ts": "2026-07-27T10:10:00Z"});
+        assert_ne!(value("bucket(ts, 5m)", &a), value("bucket(ts, 5m)", &c));
+    }
+
+    #[test]
+    fn a_window_without_width_is_missing() {
+        let r = json!({"ts": "2026-07-27T10:07:31Z"});
+        assert_eq!(value("bucket(ts, 0)", &r), None);
+        assert_eq!(value("bucket(ts, -60)", &r), None);
+        assert_eq!(value("bucket(gone, 5m)", &r), None);
     }
 
     #[test]

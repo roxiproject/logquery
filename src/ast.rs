@@ -145,6 +145,7 @@ pub enum Func {
     Ceil,
     Ts,
     FormatTime,
+    Bucket,
 }
 
 impl Func {
@@ -170,6 +171,7 @@ impl Func {
             "ceil" => Some(Func::Ceil),
             "ts" => Some(Func::Ts),
             "format_time" => Some(Func::FormatTime),
+            "bucket" => Some(Func::Bucket),
             _ => None,
         }
     }
@@ -196,6 +198,7 @@ impl Func {
             Func::Ceil => "ceil",
             Func::Ts => "ts",
             Func::FormatTime => "format_time",
+            Func::Bucket => "bucket",
         }
     }
 
@@ -211,6 +214,7 @@ impl Func {
             | Func::Ceil
             | Func::Ts => (1, Some(1)),
             Func::FormatTime => (1, Some(2)),
+            Func::Bucket => (2, Some(2)),
             Func::Round => (1, Some(2)),
             Func::Substr => (2, Some(3)),
             Func::Contains | Func::StartsWith | Func::EndsWith => (2, Some(2)),
