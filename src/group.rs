@@ -28,7 +28,8 @@ pub struct AggSpec {
     pub arg: Option<ValueExpr>,
 }
 
-/// Collect every distinct aggregate in the query's `select` and `having`.
+/// Collect every distinct aggregate in the query's `select`, `having` and
+/// `order by`.
 pub fn collect_aggregates(query: &Query) -> Vec<AggSpec> {
     let mut out: Vec<AggSpec> = Vec::new();
     if let Selection::Items(items) = &query.select {
@@ -38,6 +39,9 @@ pub fn collect_aggregates(query: &Query) -> Vec<AggSpec> {
     }
     if let Some(having) = &query.having {
         walk_expr(having, &mut out);
+    }
+    if let Some(order) = &query.order_by {
+        walk_value(&order.value, &mut out);
     }
     out
 }

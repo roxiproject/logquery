@@ -5,7 +5,7 @@
 //! ```text
 //! query      := "select" selection [ "where" expr ]
 //!               [ "group" "by" item { "," item } ] [ "having" expr ]
-//!               [ "order" "by" field [ "asc" | "desc" ] ]
+//!               [ "order" "by" value [ "asc" | "desc" ] ]
 //!               [ "limit" number ]
 //! selection  := "*" | item { "," item }
 //! item       := value [ "as" name ]
@@ -173,14 +173,14 @@ impl Parser<'_> {
 
         let order_by = if self.eat(&TokenKind::Order) {
             self.expect(TokenKind::By, "`by` after `order`")?;
-            let path = self.parse_field("a field name after `order by`")?;
+            let value = self.parse_value("a field name or a function after `order by`")?;
             let descending = if self.eat(&TokenKind::Desc) {
                 true
             } else {
                 self.eat(&TokenKind::Asc);
                 false
             };
-            Some(OrderBy { path, descending })
+            Some(OrderBy { value, descending })
         } else {
             None
         };
@@ -716,6 +716,23 @@ mod tests {
     }
 
     #[test]
+    fn order_by_takes_an_expression() {
+        let q = parse("select level, count(*) group by level order by count(*) desc").unwrap();
+        let order = q.order_by.unwrap();
+        assert_eq!(
+            order.value,
+            ValueExpr::Agg {
+                agg: Agg::Count,
+                arg: None
+            }
+        );
+        assert!(order.descending);
+
+        let q = parse("select msg order by lower(level)").unwrap();
+        assert_eq!(q.order_by.unwrap().value.to_string(), "lower(level)");
+    }
+
+    #[test]
     fn parses_group_by_and_having() {
         let q = parse("select level, count(*) group by level having count(*) > 10").unwrap();
         assert!(q.is_grouped());
@@ -818,7 +835,7 @@ mod tests {
         assert_eq!(
             q.order_by,
             Some(OrderBy {
-                path: Path::new("c"),
+                value: field("c"),
                 descending: true
             })
         );

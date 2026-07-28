@@ -21,14 +21,21 @@ impl Query {
     /// record. Writing an aggregate without `group by` is a single group over
     /// the whole input, as in SQL.
     pub fn is_grouped(&self) -> bool {
-        !self.group_by.is_empty() || self.selects_an_aggregate()
+        !self.group_by.is_empty() || self.mentions_an_aggregate()
     }
 
-    fn selects_an_aggregate(&self) -> bool {
-        match &self.select {
+    /// True when an aggregate appears anywhere the query could use one.
+    fn mentions_an_aggregate(&self) -> bool {
+        let selected = match &self.select {
             Selection::All => false,
             Selection::Items(items) => items.iter().any(|i| i.value.has_aggregate()),
-        }
+        };
+        selected
+            || self.having.is_some()
+            || self
+                .order_by
+                .as_ref()
+                .is_some_and(|o| o.value.has_aggregate())
     }
 }
 
@@ -52,7 +59,8 @@ pub struct SelectItem {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderBy {
-    pub path: Path,
+    /// The value to sort on. It need not appear in the select list.
+    pub value: ValueExpr,
     pub descending: bool,
 }
 

@@ -128,13 +128,15 @@ const SORT_KEY: &str = "\u{0}sort";
 fn row_with_sort_key(mut row: Row, record: &Record, query: &Query) -> Row {
     if let Some(order) = &query.order_by {
         // The projected row is searched first so that ordering can name an
-        // alias the select list introduced; a grouped record then holds its
-        // columns under their full text, before the dotted path walk.
+        // alias the select list introduced. A grouped record then holds its
+        // columns — group keys and aggregates alike — under the text they
+        // were written as. Failing both, the expression is evaluated.
+        let written = order.value.to_string();
         let value = row
-            .get(&order.path.raw)
-            .or_else(|| record.get(&order.path.raw))
-            .or_else(|| lookup(record, &order.path.segments))
-            .cloned();
+            .get(&written)
+            .or_else(|| record.get(&written))
+            .cloned()
+            .or_else(|| eval_value(&order.value, record));
         if let Some(v) = value {
             row.insert(SORT_KEY.to_string(), v);
         }
@@ -439,6 +441,24 @@ mod tests {
         );
         let got: Vec<&str> = rows.iter().map(|r| r["level"].as_str().unwrap()).collect();
         assert_eq!(got, vec!["error", "info"]);
+    }
+
+    #[test]
+    fn grouped_rows_order_by_an_aggregate_that_was_not_selected() {
+        let rows = run(
+            "select level group by level order by max(duration_ms) desc",
+            LOG,
+        );
+        let got: Vec<&str> = rows.iter().map(|r| r["level"].as_str().unwrap()).collect();
+        assert_eq!(got, vec!["error", "info", "warn"]);
+        assert!(!rows[0].contains_key(SORT_KEY));
+        assert_eq!(rows[0].len(), 1);
+    }
+
+    #[test]
+    fn order_by_a_computed_value() {
+        let rows = run("select msg order by len(msg) desc limit 1", LOG);
+        assert_eq!(rows[0]["msg"], json!("disk write failed"));
     }
 
     #[test]
