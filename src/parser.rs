@@ -26,7 +26,8 @@
 //! `(not (a = 1)) and (b = 2)`.
 
 use crate::ast::{
-    Agg, ArithOp, CmpOp, Expr, Func, Literal, OrderBy, Path, Query, SelectItem, Selection, ValueExpr,
+    Agg, ArithOp, CmpOp, Expr, Func, Literal, OrderBy, Path, Query, SelectItem, Selection,
+    ValueExpr,
 };
 use crate::lexer::{tokenize, QueryError, Token, TokenKind};
 
@@ -312,17 +313,6 @@ impl Parser<'_> {
             value.to_string()
         };
         Ok(SelectItem { value, label })
-    }
-
-    fn parse_field(&mut self, expected: &str) -> Result<Path, QueryError> {
-        match &self.peek().kind {
-            TokenKind::Ident(name) => {
-                let path = Path::new(name.clone());
-                self.bump();
-                Ok(path)
-            }
-            _ => Err(self.err_here(expected)),
-        }
     }
 
     fn parse_expr(&mut self) -> Result<Expr, QueryError> {

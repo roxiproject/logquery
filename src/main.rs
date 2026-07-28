@@ -21,7 +21,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::engine::Engine;
 use crate::output::Format;
-use crate::record::parse_line;
+use crate::record::{parse_line, parse_with_pattern};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -35,20 +35,28 @@ USAGE:
 
 OPTIONS:
     -f, --format <FORMAT>  table (default), json, or csv
+    -p, --pattern <REGEX>  read plain-text lines with this pattern; each
+                           named group `(?<name>…)` becomes a field
     -F, --follow           keep reading the file as it grows, like `tail -f`
     -q, --quiet            do not report malformed lines
     -h, --help             print this help
     -V, --version          print the version
 
 QUERY:
-    select <* | field[, field...]>
+    select <* | value [as name][, ...]>
       [ where <expression> ]
-      [ order by <field> [asc|desc] ]
+      [ group by <value>[, ...] ] [ having <expression> ]
+      [ order by <value> [asc|desc] ]
       [ limit <n> ]
 
 EXAMPLES:
     logquery 'select level, msg where level = \"error\"' app.log
     logquery 'select * where duration_ms > 100 order by duration_ms desc limit 20' app.log
+    logquery 'select level, count(*) as n group by level order by n desc' app.log
+    logquery 'select format_time(bucket(ts, 5m)) as window, count(*) as n
+               where level = \"error\" group by bucket(ts, 5m)' app.log
+    logquery -p '^(?<ip>\\S+) \\S+ \\S+ \\[[^]]+\\] \"(?<method>[A-Z]+) (?<path>\\S+)' \\
+      'select ip, path where method = \"POST\"' access.log
     kubectl logs pod | logquery -f json 'select ts, msg where msg like \"%timeout%\"'
 ";
 
@@ -71,6 +79,9 @@ struct Options {
     query: String,
     inputs: Vec<Input>,
     format: Format,
+    /// Set by `--pattern`: plain-text lines are read with this instead of
+    /// being auto-detected as JSON or logfmt.
+    pattern: Option<String>,
     follow: bool,
     quiet: bool,
 }
@@ -100,6 +111,21 @@ fn run() -> Result<ExitCode> {
     if opts.follow && query.order_by.is_some() {
         bail!("--follow cannot be combined with `order by`: sorting needs the whole input");
     }
+    if opts.follow && query.is_grouped() {
+        bail!("--follow cannot be combined with `group by`: no group is complete until the \
+               input ends");
+    }
+
+    let pattern = match &opts.pattern {
+        None => None,
+        Some(src) => match pattern::Pattern::compile(src) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("logquery: {e}");
+                return Ok(ExitCode::from(EXIT_QUERY_ERROR));
+            }
+        },
+    };
 
     let mut engine = Engine::new(&query);
     let mut writer = output::writer(
@@ -119,7 +145,13 @@ fn run() -> Result<ExitCode> {
                 File::open(p).with_context(|| format!("cannot open {}", p.display()))?,
             )),
         };
-        match pump(reader, &mut engine, writer.as_mut(), &mut skipped) {
+        match pump(
+            reader,
+            &mut engine,
+            writer.as_mut(),
+            pattern.as_ref(),
+            &mut skipped,
+        ) {
             Ok(Done::LimitReached) => {
                 stopped_early = true;
                 break;
@@ -133,7 +165,13 @@ fn run() -> Result<ExitCode> {
     if opts.follow && !stopped_early {
         // `parse_args` guarantees exactly one file when following.
         if let Some(Input::File(path)) = opts.inputs.last() {
-            match follow(path, &mut engine, writer.as_mut(), &mut skipped) {
+            match follow(
+                path,
+                &mut engine,
+                writer.as_mut(),
+                pattern.as_ref(),
+                &mut skipped,
+            ) {
                 Ok(()) => {}
                 Err(e) if is_broken_pipe(&e) => return Ok(ExitCode::SUCCESS),
                 Err(e) => return Err(e).context("following input"),
@@ -155,10 +193,18 @@ fn run() -> Result<ExitCode> {
     }
 
     if skipped > 0 && !opts.quiet {
-        eprintln!(
-            "logquery: skipped {skipped} malformed line{}",
-            if skipped == 1 { "" } else { "s" }
-        );
+        let plural = if skipped == 1 { "" } else { "s" };
+        match &pattern {
+            // With a pattern, "malformed" is misleading: the line was fine,
+            // it just did not match. Naming the fields the pattern extracts
+            // is usually enough to see why.
+            Some(p) => eprintln!(
+                "logquery: skipped {skipped} line{plural} that did not match the pattern \
+                 (fields: {})",
+                p.capture_names().join(", ")
+            ),
+            None => eprintln!("logquery: skipped {skipped} malformed line{plural}"),
+        }
     }
 
     Ok(ExitCode::SUCCESS)
@@ -174,6 +220,7 @@ fn pump(
     mut reader: Box<dyn BufRead>,
     engine: &mut Engine<'_>,
     writer: &mut dyn output::Writer,
+    pattern: Option<&pattern::Pattern>,
     skipped: &mut usize,
 ) -> io::Result<Done> {
     let mut raw = Vec::new();
@@ -189,7 +236,7 @@ fn pump(
         }
         match std::str::from_utf8(&raw) {
             Ok(s) => {
-                if !handle_line(s, engine, writer, skipped)? {
+                if !handle_line(s, engine, writer, pattern, skipped)? {
                     return Ok(Done::LimitReached);
                 }
             }
@@ -216,10 +263,18 @@ fn handle_line(
     line: &str,
     engine: &mut Engine<'_>,
     writer: &mut dyn output::Writer,
+    pattern: Option<&pattern::Pattern>,
     skipped: &mut usize,
 ) -> io::Result<bool> {
-    match parse_line(line) {
-        Some((rec, _)) => {
+    // With a pattern the line is plain text and nothing else is tried: a
+    // pattern that stops matching should be reported, not silently papered
+    // over by the JSON reader.
+    let parsed = match pattern {
+        Some(p) => parse_with_pattern(line, p),
+        None => parse_line(line).map(|(rec, _)| rec),
+    };
+    match parsed {
+        Some(rec) => {
             if let Some(row) = engine.accept(&rec) {
                 writer.write(&row)?;
             }
@@ -243,6 +298,7 @@ fn follow(
     path: &Path,
     engine: &mut Engine<'_>,
     writer: &mut dyn output::Writer,
+    pattern: Option<&pattern::Pattern>,
     skipped: &mut usize,
 ) -> io::Result<()> {
     let mut file = File::open(path)?;
@@ -297,7 +353,7 @@ fn follow(
             }
             match std::str::from_utf8(raw) {
                 Ok(s) => {
-                    if !handle_line(s, engine, writer, skipped)? {
+                    if !handle_line(s, engine, writer, pattern, skipped)? {
                         return Ok(());
                     }
                 }
@@ -321,6 +377,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>> {
     let mut query: Option<String> = None;
     let mut inputs: Vec<Input> = Vec::new();
     let mut format = Format::Table;
+    let mut pattern: Option<String> = None;
     let mut follow = false;
     let mut quiet = false;
     let mut no_more_flags = false;
@@ -351,6 +408,13 @@ fn parse_args(args: &[String]) -> Result<Option<Options>> {
                 println!("logquery {VERSION}");
                 return Ok(None);
             }
+            "-p" | "--pattern" => {
+                i += 1;
+                let Some(p) = args.get(i) else {
+                    bail!("{arg} needs a regular expression");
+                };
+                pattern = Some(p.clone());
+            }
             "-F" | "--follow" => follow = true,
             "-q" | "--quiet" => quiet = true,
             "-f" | "--format" => {
@@ -362,7 +426,9 @@ fn parse_args(args: &[String]) -> Result<Option<Options>> {
                     .with_context(|| format!("unknown format `{name}`; use table, json, or csv"))?;
             }
             other => {
-                if let Some(name) = other.strip_prefix("--format=") {
+                if let Some(p) = other.strip_prefix("--pattern=") {
+                    pattern = Some(p.to_string());
+                } else if let Some(name) = other.strip_prefix("--format=") {
                     format = Format::parse(name).with_context(|| {
                         format!("unknown format `{name}`; use table, json, or csv")
                     })?;
@@ -395,6 +461,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>> {
         query,
         inputs,
         format,
+        pattern,
         follow,
         quiet,
     }))
@@ -462,6 +529,28 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(o.inputs, vec![Input::File("-weird-name.log".into())]);
+    }
+
+    #[test]
+    fn pattern_accepts_every_spelling() {
+        for a in [
+            args(&["-p", "^(?<a>.)", "select *"]),
+            args(&["--pattern", "^(?<a>.)", "select *"]),
+            args(&["--pattern=^(?<a>.)", "select *"]),
+        ] {
+            let o = parse_args(&a).unwrap().unwrap();
+            assert_eq!(o.pattern.as_deref(), Some("^(?<a>.)"));
+        }
+    }
+
+    #[test]
+    fn no_pattern_by_default() {
+        assert!(parse_args(&args(&["select *"])).unwrap().unwrap().pattern.is_none());
+    }
+
+    #[test]
+    fn pattern_without_a_value_is_rejected() {
+        assert!(parse_args(&args(&["select *", "-p"])).is_err());
     }
 
     #[test]
