@@ -14,7 +14,8 @@
 //! not_expr   := "not" not_expr | predicate
 //! predicate  := primary [ ( cmp_op value ) | ( ["not"] "like" value ) ]
 //! primary    := "(" expr ")" | value
-//! value      := call | field | literal
+//! value      := atom { ( "+" | "-" ) atom }
+//! atom       := "(" value ")" | call | field | literal | duration
 //! call       := name "(" [ value { "," value } ] ")"
 //! ```
 //!
@@ -23,7 +24,7 @@
 //! `(not (a = 1)) and (b = 2)`.
 
 use crate::ast::{
-    CmpOp, Expr, Func, Literal, OrderBy, Path, Query, SelectItem, Selection, ValueExpr,
+    ArithOp, CmpOp, Expr, Func, Literal, OrderBy, Path, Query, SelectItem, Selection, ValueExpr,
 };
 use crate::lexer::{tokenize, QueryError, Token, TokenKind};
 
@@ -308,9 +309,36 @@ impl Parser<'_> {
         }
     }
 
-    /// A value: a call, a field, or a literal.
+    /// A value, including any `+`/`-` chain applied to it. The operators are
+    /// left-associative, so `a - b - c` is `(a - b) - c`.
     fn parse_value(&mut self, expected: &str) -> Result<ValueExpr, QueryError> {
+        let mut left = self.parse_atom(expected)?;
+        loop {
+            let op = match self.peek().kind {
+                TokenKind::Plus => ArithOp::Add,
+                TokenKind::Minus => ArithOp::Sub,
+                _ => return Ok(left),
+            };
+            self.bump();
+            let right = self.parse_atom("a value after the operator")?;
+            left = ValueExpr::Arith {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+    }
+
+    /// A single value: a call, a field, a literal, or a parenthesised sum.
+    fn parse_atom(&mut self, expected: &str) -> Result<ValueExpr, QueryError> {
         let t = self.peek().clone();
+        // Parentheses around a value group its arithmetic. A parenthesised
+        // condition is handled by `parse_predicate` before this point.
+        if self.eat(&TokenKind::LParen) {
+            let inner = self.parse_value(expected)?;
+            self.expect(TokenKind::RParen, "`)` to close the group")?;
+            return Ok(inner);
+        }
         // `name(` is a call; a bare name is a field.
         if let TokenKind::Ident(name) = &t.kind {
             if self.tokens.get(self.pos + 1).map(|t| &t.kind) == Some(&TokenKind::LParen) {
@@ -321,6 +349,7 @@ impl Parser<'_> {
             TokenKind::Ident(name) => ValueExpr::Field(Path::new(name)),
             TokenKind::Str(s) => ValueExpr::Lit(Literal::Str(s)),
             TokenKind::Num(n) => ValueExpr::Lit(Literal::Num(n)),
+            TokenKind::Duration(secs) => ValueExpr::Lit(Literal::Duration(secs)),
             TokenKind::Bool(b) => ValueExpr::Lit(Literal::Bool(b)),
             TokenKind::Null => ValueExpr::Lit(Literal::Null),
             _ => return Err(self.err_here(expected)),
@@ -512,6 +541,62 @@ mod tests {
     fn an_alias_without_a_name_is_an_error() {
         let err = parse("select a as").unwrap_err();
         assert!(err.message.contains("column name after `as`"), "{}", err.message);
+    }
+
+    #[test]
+    fn parses_addition_and_subtraction() {
+        let e = parse_expr("ts > now() - 15m").unwrap();
+        assert_eq!(
+            e,
+            cmp(
+                CmpOp::Gt,
+                field("ts"),
+                ValueExpr::Arith {
+                    op: ArithOp::Sub,
+                    left: Box::new(ValueExpr::Call {
+                        func: Func::Now,
+                        args: vec![]
+                    }),
+                    right: Box::new(ValueExpr::Lit(Literal::Duration(900.0))),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn arithmetic_is_left_associative() {
+        let q = parse("select a - b - c").unwrap();
+        assert_eq!(labels(&q), vec!["a - b - c"]);
+        match &values(&q)[0] {
+            ValueExpr::Arith { left, .. } => {
+                assert!(matches!(**left, ValueExpr::Arith { .. }), "left should nest")
+            }
+            other => panic!("expected a sum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parentheses_regroup_a_sum_and_survive_the_label() {
+        let q = parse("select a - (b - c)").unwrap();
+        assert_eq!(labels(&q), vec!["a - (b - c)"]);
+        match &values(&q)[0] {
+            ValueExpr::Arith { right, .. } => {
+                assert!(matches!(**right, ValueExpr::Arith { .. }), "right should nest")
+            }
+            other => panic!("expected a sum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unclosed_value_group_is_an_error() {
+        let err = parse("select (a - b").unwrap_err();
+        assert!(err.message.contains("`)`"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_dangling_arithmetic_operator_is_an_error() {
+        let err = parse("select a +").unwrap_err();
+        assert!(err.message.contains("value after the operator"), "{}", err.message);
     }
 
     #[test]
