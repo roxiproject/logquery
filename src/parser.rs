@@ -6,21 +6,25 @@
 //! query      := "select" selection [ "where" expr ]
 //!               [ "order" "by" field [ "asc" | "desc" ] ]
 //!               [ "limit" number ]
-//! selection  := "*" | field { "," field }
+//! selection  := "*" | item { "," item }
+//! item       := value [ "as" name ]
 //! expr       := or_expr
 //! or_expr    := and_expr { "or" and_expr }
 //! and_expr   := not_expr { "and" not_expr }
 //! not_expr   := "not" not_expr | predicate
-//! predicate  := primary [ ( cmp_op primary ) | ( ["not"] "like" primary ) ]
-//! primary    := "(" expr ")" | field | literal
+//! predicate  := primary [ ( cmp_op value ) | ( ["not"] "like" value ) ]
+//! primary    := "(" expr ")" | value
+//! value      := call | field | literal
+//! call       := name "(" [ value { "," value } ] ")"
 //! ```
 //!
 //! `not` binds tighter than `and`, which binds tighter than `or`. Comparisons
 //! bind tighter than all three, so `not a = 1 and b = 2` parses as
 //! `(not (a = 1)) and (b = 2)`.
 
-use crate::ast::{CmpOp, Expr, Literal, OrderBy, Path, Query, Selection};
-use crate::ast::Operand;
+use crate::ast::{
+    CmpOp, Expr, Func, Literal, OrderBy, Path, Query, SelectItem, Selection, ValueExpr,
+};
 use crate::lexer::{tokenize, QueryError, Token, TokenKind};
 
 pub fn parse(query: &str) -> Result<Query, QueryError> {
@@ -49,6 +53,17 @@ pub fn parse_expr(src: &str) -> Result<Expr, QueryError> {
     let e = p.parse_expr()?;
     p.expect_eof()?;
     Ok(e)
+}
+
+/// Render an arity for an error message: "1 argument", "2 or 3 arguments",
+/// "at least 1 argument".
+fn describe_arity(min: usize, max: Option<usize>) -> String {
+    let plural = |n: usize| if n == 1 { "argument" } else { "arguments" };
+    match max {
+        Some(m) if m == min => format!("{min} {}", plural(min)),
+        Some(m) => format!("{min} to {m} arguments"),
+        None => format!("at least {min} {}", plural(min)),
+    }
 }
 
 struct Parser<'a> {
@@ -165,11 +180,35 @@ impl Parser<'_> {
         if self.eat(&TokenKind::Star) {
             return Ok(Selection::All);
         }
-        let mut fields = vec![self.parse_field("`*` or a field name after `select`")?];
+        let mut items = vec![self.parse_select_item("`*`, a field name or a function after `select`")?];
         while self.eat(&TokenKind::Comma) {
-            fields.push(self.parse_field("a field name after `,`")?);
+            items.push(self.parse_select_item("a field name or a function after `,`")?);
         }
-        Ok(Selection::Fields(fields))
+        Ok(Selection::Items(items))
+    }
+
+    /// One select entry, with an optional `as` alias. Without an alias the
+    /// column is headed with the expression exactly as it was written.
+    fn parse_select_item(&mut self, expected: &str) -> Result<SelectItem, QueryError> {
+        let value = self.parse_value(expected)?;
+        let label = if self.eat(&TokenKind::As) {
+            match &self.peek().kind {
+                TokenKind::Ident(name) => {
+                    let name = name.clone();
+                    self.bump();
+                    name
+                }
+                TokenKind::Str(name) => {
+                    let name = name.clone();
+                    self.bump();
+                    name
+                }
+                _ => return Err(self.err_here("a column name after `as`")),
+            }
+        } else {
+            value.to_string()
+        };
+        Ok(SelectItem { value, label })
     }
 
     fn parse_field(&mut self, expected: &str) -> Result<Path, QueryError> {
@@ -223,16 +262,16 @@ impl Parser<'_> {
             return Ok(inner);
         }
 
-        let left = self.parse_operand()?;
+        let left = self.parse_value("a field name, a function or a literal value")?;
 
         if let Some(op) = self.peek_cmp() {
             self.bump();
-            let right = self.parse_operand()?;
+            let right = self.parse_value("a field name, a function or a literal value")?;
             return Ok(Expr::Compare { op, left, right });
         }
 
         if self.eat(&TokenKind::Like) {
-            let pattern = self.parse_operand()?;
+            let pattern = self.parse_value("a pattern after `like`")?;
             return Ok(Expr::Like {
                 left,
                 pattern,
@@ -246,7 +285,7 @@ impl Parser<'_> {
         {
             self.bump();
             self.bump();
-            let pattern = self.parse_operand()?;
+            let pattern = self.parse_value("a pattern after `not like`")?;
             return Ok(Expr::Like {
                 left,
                 pattern,
@@ -269,35 +308,81 @@ impl Parser<'_> {
         }
     }
 
-    fn parse_operand(&mut self) -> Result<Operand, QueryError> {
+    /// A value: a call, a field, or a literal.
+    fn parse_value(&mut self, expected: &str) -> Result<ValueExpr, QueryError> {
         let t = self.peek().clone();
-        let operand = match t.kind {
-            TokenKind::Ident(name) => Operand::Field(Path::new(name)),
-            TokenKind::Str(s) => Operand::Lit(Literal::Str(s)),
-            TokenKind::Num(n) => Operand::Lit(Literal::Num(n)),
-            TokenKind::Bool(b) => Operand::Lit(Literal::Bool(b)),
-            TokenKind::Null => Operand::Lit(Literal::Null),
-            _ => return Err(self.err_here("a field name or a literal value")),
+        // `name(` is a call; a bare name is a field.
+        if let TokenKind::Ident(name) = &t.kind {
+            if self.tokens.get(self.pos + 1).map(|t| &t.kind) == Some(&TokenKind::LParen) {
+                return self.parse_call(name.clone(), t.col);
+            }
+        }
+        let value = match t.kind {
+            TokenKind::Ident(name) => ValueExpr::Field(Path::new(name)),
+            TokenKind::Str(s) => ValueExpr::Lit(Literal::Str(s)),
+            TokenKind::Num(n) => ValueExpr::Lit(Literal::Num(n)),
+            TokenKind::Bool(b) => ValueExpr::Lit(Literal::Bool(b)),
+            TokenKind::Null => ValueExpr::Lit(Literal::Null),
+            _ => return Err(self.err_here(expected)),
         };
         self.bump();
-        Ok(operand)
+        Ok(value)
+    }
+
+    fn parse_call(&mut self, name: String, col: usize) -> Result<ValueExpr, QueryError> {
+        let Some(func) = Func::parse(&name) else {
+            return Err(QueryError::new(
+                format!("unknown function `{name}`"),
+                col,
+                self.src,
+            ));
+        };
+        self.bump(); // name
+        self.bump(); // `(`
+        let mut args = Vec::new();
+        if !self.eat(&TokenKind::RParen) {
+            loop {
+                args.push(self.parse_value("an argument")?);
+                if self.eat(&TokenKind::Comma) {
+                    continue;
+                }
+                self.expect(TokenKind::RParen, "`,` or `)` to close the argument list")?;
+                break;
+            }
+        }
+        let (min, max) = func.arity();
+        if args.len() < min || max.map(|m| args.len() > m).unwrap_or(false) {
+            return Err(QueryError::new(
+                format!(
+                    "`{}` takes {}, but {} {} given",
+                    func.name(),
+                    describe_arity(min, max),
+                    args.len(),
+                    if args.len() == 1 { "was" } else { "were" }
+                ),
+                col,
+                self.src,
+            ));
+        }
+        Ok(ValueExpr::Call { func, args })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::Func;
 
-    fn field(name: &str) -> Operand {
-        Operand::Field(Path::new(name))
+    fn field(name: &str) -> ValueExpr {
+        ValueExpr::Field(Path::new(name))
     }
-    fn s(v: &str) -> Operand {
-        Operand::Lit(Literal::Str(v.into()))
+    fn s(v: &str) -> ValueExpr {
+        ValueExpr::Lit(Literal::Str(v.into()))
     }
-    fn n(v: f64) -> Operand {
-        Operand::Lit(Literal::Num(v))
+    fn n(v: f64) -> ValueExpr {
+        ValueExpr::Lit(Literal::Num(v))
     }
-    fn cmp(op: CmpOp, l: Operand, r: Operand) -> Expr {
+    fn cmp(op: CmpOp, l: ValueExpr, r: ValueExpr) -> Expr {
         Expr::Compare {
             op,
             left: l,
@@ -314,23 +399,125 @@ mod tests {
         assert!(q.limit.is_none());
     }
 
+    fn labels(q: &Query) -> Vec<String> {
+        match &q.select {
+            Selection::All => Vec::new(),
+            Selection::Items(items) => items.iter().map(|i| i.label.clone()).collect(),
+        }
+    }
+
+    fn values(q: &Query) -> Vec<ValueExpr> {
+        match &q.select {
+            Selection::All => Vec::new(),
+            Selection::Items(items) => items.iter().map(|i| i.value.clone()).collect(),
+        }
+    }
+
     #[test]
     fn parses_a_field_list() {
         let q = parse("select level, msg, user.id").unwrap();
         assert_eq!(
-            q.select,
-            Selection::Fields(vec![
-                Path::new("level"),
-                Path::new("msg"),
-                Path::new("user.id")
-            ])
+            values(&q),
+            vec![field("level"), field("msg"), field("user.id")]
         );
+        assert_eq!(labels(&q), vec!["level", "msg", "user.id"]);
+    }
+
+    #[test]
+    fn parses_function_calls_in_the_selection() {
+        let q = parse("select lower(level), substr(msg, 0, 20)").unwrap();
+        assert_eq!(
+            values(&q),
+            vec![
+                ValueExpr::Call {
+                    func: Func::Lower,
+                    args: vec![field("level")]
+                },
+                ValueExpr::Call {
+                    func: Func::Substr,
+                    args: vec![field("msg"), n(0.0), n(20.0)]
+                },
+            ]
+        );
+        assert_eq!(labels(&q), vec!["lower(level)", "substr(msg, 0, 20)"]);
+    }
+
+    #[test]
+    fn parses_a_call_with_no_arguments() {
+        let q = parse("select now()").unwrap();
+        assert_eq!(
+            values(&q),
+            vec![ValueExpr::Call {
+                func: Func::Now,
+                args: vec![]
+            }]
+        );
+        assert_eq!(labels(&q), vec!["now()"]);
+    }
+
+    #[test]
+    fn calls_nest() {
+        let q = parse("select upper(coalesce(user.name, \"anon\"))").unwrap();
+        assert_eq!(labels(&q), vec!["upper(coalesce(user.name, \"anon\"))"]);
+    }
+
+    #[test]
+    fn an_alias_renames_the_column() {
+        let q = parse("select lower(level) as lvl, msg as \"the message\"").unwrap();
+        assert_eq!(labels(&q), vec!["lvl", "the message"]);
+    }
+
+    #[test]
+    fn functions_are_usable_in_where() {
+        let e = parse_expr("lower(level) = \"error\"").unwrap();
+        assert_eq!(
+            e,
+            cmp(
+                CmpOp::Eq,
+                ValueExpr::Call {
+                    func: Func::Lower,
+                    args: vec![field("level")]
+                },
+                s("error")
+            )
+        );
+    }
+
+    #[test]
+    fn an_unknown_function_is_an_error() {
+        let err = parse("select sqrt(x)").unwrap_err();
+        assert!(err.message.contains("unknown function `sqrt`"), "{}", err.message);
+        assert_eq!(err.col, 8);
+    }
+
+    #[test]
+    fn the_wrong_number_of_arguments_is_an_error() {
+        let err = parse("select lower(a, b)").unwrap_err();
+        assert!(err.message.contains("takes 1 argument"), "{}", err.message);
+        let err = parse("select substr(a)").unwrap_err();
+        assert!(err.message.contains("2 to 3 arguments"), "{}", err.message);
+        let err = parse("select now(1)").unwrap_err();
+        assert!(err.message.contains("takes 0 arguments"), "{}", err.message);
+        let err = parse("select coalesce()").unwrap_err();
+        assert!(err.message.contains("at least 1 argument"), "{}", err.message);
+    }
+
+    #[test]
+    fn an_unclosed_argument_list_is_an_error() {
+        let err = parse("select lower(a").unwrap_err();
+        assert!(err.message.contains("`)`"), "{}", err.message);
+    }
+
+    #[test]
+    fn an_alias_without_a_name_is_an_error() {
+        let err = parse("select a as").unwrap_err();
+        assert!(err.message.contains("column name after `as`"), "{}", err.message);
     }
 
     #[test]
     fn parses_every_clause() {
         let q = parse("select a where b = 1 order by c desc limit 5").unwrap();
-        assert_eq!(q.select, Selection::Fields(vec![Path::new("a")]));
+        assert_eq!(values(&q), vec![field("a")]);
         assert_eq!(q.filter, Some(cmp(CmpOp::Eq, field("b"), n(1.0))));
         assert_eq!(
             q.order_by,
@@ -462,11 +649,11 @@ mod tests {
     fn parses_bool_and_null_literals() {
         assert_eq!(
             parse_expr("ok = true").unwrap(),
-            cmp(CmpOp::Eq, field("ok"), Operand::Lit(Literal::Bool(true)))
+            cmp(CmpOp::Eq, field("ok"), ValueExpr::Lit(Literal::Bool(true)))
         );
         assert_eq!(
             parse_expr("err != null").unwrap(),
-            cmp(CmpOp::Ne, field("err"), Operand::Lit(Literal::Null))
+            cmp(CmpOp::Ne, field("err"), ValueExpr::Lit(Literal::Null))
         );
     }
 
@@ -480,7 +667,7 @@ mod tests {
     #[test]
     fn trailing_comma_in_selection_is_an_error() {
         let err = parse("select a, b,").unwrap_err();
-        assert!(err.message.contains("field name after `,`"), "{}", err.message);
+        assert!(err.message.contains("field name or a function after `,`"), "{}", err.message);
         assert_eq!(err.col, 13);
     }
 
@@ -495,7 +682,7 @@ mod tests {
     fn dangling_operator_is_an_error() {
         let err = parse("select * where a =").unwrap_err();
         assert!(
-            err.message.contains("field name or a literal"),
+            err.message.contains("field name, a function or a literal"),
             "{}",
             err.message
         );
