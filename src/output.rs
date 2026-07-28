@@ -1,4 +1,4 @@
-//! Output formats: aligned table, JSON Lines, and CSV.
+//! Output formats: aligned table, JSON Lines, CSV, and Markdown.
 //!
 //! Every writer implements the same two-call protocol: [`Writer::write`] for
 //! each row and [`Writer::finish`] once at the end. The table writer buffers by
@@ -16,6 +16,8 @@ pub enum Format {
     Table,
     Json,
     Csv,
+    /// A pipe table, for pasting a summary into an issue or a pull request.
+    Markdown,
 }
 
 impl Format {
@@ -24,6 +26,7 @@ impl Format {
             "table" => Some(Format::Table),
             "json" | "jsonl" | "ndjson" => Some(Format::Json),
             "csv" => Some(Format::Csv),
+            "markdown" | "md" => Some(Format::Markdown),
             _ => None,
         }
     }
@@ -48,6 +51,11 @@ pub fn writer<W: Write + 'static>(
     match format {
         Format::Table => Box::new(TableWriter::new(out, columns, incremental)),
         Format::Json => Box::new(JsonWriter { out }),
+        Format::Markdown => Box::new(MarkdownWriter {
+            out,
+            columns,
+            rows: Vec::new(),
+        }),
         Format::Csv => Box::new(CsvWriter {
             out,
             columns,
@@ -135,6 +143,58 @@ impl<W: Write> Writer for CsvWriter<W> {
         }
         self.out.flush()
     }
+}
+
+/// Writes a Markdown pipe table.
+///
+/// Rows are held until the end so the header covers every column that turned
+/// up, exactly as the CSV writer does. Cells are escaped for the two things
+/// that would otherwise break the table: a pipe, and a line break.
+struct MarkdownWriter<W: Write> {
+    out: W,
+    columns: Option<Vec<String>>,
+    rows: Vec<Row>,
+}
+
+impl<W: Write> Writer for MarkdownWriter<W> {
+    fn write(&mut self, row: &Row) -> io::Result<()> {
+        self.rows.push(row.clone());
+        Ok(())
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        let rows = std::mem::take(&mut self.rows);
+        let cols = match &self.columns {
+            Some(c) => c.clone(),
+            None => discover_columns(&rows),
+        };
+        if cols.is_empty() {
+            return self.out.flush();
+        }
+        let header: Vec<String> = cols.iter().map(|c| markdown_escape(c)).collect();
+        writeln!(self.out, "| {} |", header.join(" | "))?;
+        let rule: Vec<&str> = cols.iter().map(|_| "---").collect();
+        writeln!(self.out, "| {} |", rule.join(" | "))?;
+        for row in &rows {
+            let cells: Vec<String> = cols
+                .iter()
+                .map(|c| markdown_escape(&cell_text(row.get(c))))
+                .collect();
+            writeln!(self.out, "| {} |", cells.join(" | "))?;
+        }
+        self.out.flush()
+    }
+}
+
+/// Escape the characters that would break a pipe table. A newline becomes the
+/// `<br>` that Markdown renderers use inside a cell, since a real line break
+/// would end the row.
+pub fn markdown_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace("\r\n", "<br>")
+        .replace('\n', "<br>")
+        .replace('\r', "<br>")
 }
 
 /// RFC 4180 quoting: wrap in double quotes when the cell contains a comma,
@@ -487,5 +547,49 @@ mod tests {
             all.lines().collect::<Vec<_>>(),
             vec!["a", "-", "1", "a", "----------", "wide value"]
         );
+    }
+
+    #[test]
+    fn markdown_renders_a_pipe_table() {
+        let out = render(
+            Format::Markdown,
+            Some(vec!["level".into(), "n".into()]),
+            &[json!({"level": "error", "n": 3}), json!({"level": "info", "n": 7})],
+        );
+        assert_eq!(
+            out,
+            "| level | n |\n| --- | --- |\n| error | 3 |\n| info | 7 |\n"
+        );
+    }
+
+    #[test]
+    fn markdown_discovers_columns_for_select_star() {
+        let out = render(
+            Format::Markdown,
+            None,
+            &[json!({"a": 1}), json!({"a": 2, "b": 3})],
+        );
+        assert_eq!(out, "| a | b |\n| --- | --- |\n| 1 |  |\n| 2 | 3 |\n");
+    }
+
+    #[test]
+    fn markdown_escapes_pipes_and_line_breaks() {
+        assert_eq!(markdown_escape("a|b"), "a\\|b");
+        assert_eq!(markdown_escape("one\ntwo"), "one<br>two");
+        assert_eq!(markdown_escape("one\r\ntwo"), "one<br>two");
+        assert_eq!(markdown_escape("back\\slash"), "back\\\\slash");
+        assert_eq!(markdown_escape("plain"), "plain");
+    }
+
+    #[test]
+    fn markdown_with_no_rows_writes_nothing() {
+        assert_eq!(render(Format::Markdown, None, &[]), "");
+    }
+
+    #[test]
+    fn markdown_is_named_by_both_spellings() {
+        assert_eq!(Format::parse("markdown"), Some(Format::Markdown));
+        assert_eq!(Format::parse("md"), Some(Format::Markdown));
+        assert_eq!(Format::parse("MD"), Some(Format::Markdown));
     }
 }

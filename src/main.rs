@@ -34,7 +34,7 @@ USAGE:
     With no FILE, or with `-`, the query reads standard input.
 
 OPTIONS:
-    -f, --format <FORMAT>  table (default), json, or csv
+    -f, --format <FORMAT>  table (default), json, csv, or markdown
     -p, --pattern <REGEX>  read plain-text lines with this pattern; each
                            named group `(?<name>…)` becomes a field
     -F, --follow           keep reading the file as it grows, like `tail -f`
@@ -420,17 +420,17 @@ fn parse_args(args: &[String]) -> Result<Option<Options>> {
             "-f" | "--format" => {
                 i += 1;
                 let Some(name) = args.get(i) else {
-                    bail!("{arg} needs a value: table, json, or csv");
+                    bail!("{arg} needs a value: table, json, csv, or markdown");
                 };
                 format = Format::parse(name)
-                    .with_context(|| format!("unknown format `{name}`; use table, json, or csv"))?;
+                    .with_context(|| format!("unknown format `{name}`; use table, json, csv, or markdown"))?;
             }
             other => {
                 if let Some(p) = other.strip_prefix("--pattern=") {
                     pattern = Some(p.to_string());
                 } else if let Some(name) = other.strip_prefix("--format=") {
                     format = Format::parse(name).with_context(|| {
-                        format!("unknown format `{name}`; use table, json, or csv")
+                        format!("unknown format `{name}`; use table, json, csv, or markdown")
                     })?;
                 } else {
                     bail!("unknown option `{other}`\n\n{USAGE}");
