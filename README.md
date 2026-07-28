@@ -59,21 +59,29 @@ Exit codes: `0` success, `1` runtime failure (missing file, I/O error), `2` the 
 
 ```
 query      := "select" selection [ "where" expr ]
-                                 [ "order" "by" field [ "asc" | "desc" ] ]
+                                 [ "group" "by" value { "," value } ]
+                                 [ "having" expr ]
+                                 [ "order" "by" value [ "asc" | "desc" ] ]
                                  [ "limit" number ]
 
-selection  := "*" | field { "," field }
+selection  := "*" | item { "," item }
+item       := value [ "as" name ]
 
 expr       := or_expr
 or_expr    := and_expr { "or" and_expr }
 and_expr   := not_expr { "and" not_expr }
 not_expr   := "not" not_expr | predicate
-predicate  := primary [ ( cmp_op primary ) | ( ["not"] "like" primary ) ]
-primary    := "(" expr ")" | field | literal
+predicate  := value [ ( cmp_op value ) | ( ["not"] "like" value ) ]
+
+value      := atom { ( "+" | "-" ) atom }
+atom       := "(" value ")" | call | agg | field | literal
+call       := name "(" [ value { "," value } ] ")"
+agg        := name "(" ( "*" | value ) ")"
 
 cmp_op     := "=" | "!=" | "<" | "<=" | ">" | ">="
 field      := name { "." name }
-literal    := string | number | "true" | "false" | "null"
+literal    := string | number | duration | "true" | "false" | "null"
+duration   := number ( "ms" | "s" | "m" | "h" | "d" )
 ```
 
 Precedence, loosest first: `or`, `and`, `not`, then comparisons. So `not a = 1 and b = 2` is `(not (a = 1)) and (b = 2)`. Parentheses override.
@@ -84,9 +92,13 @@ Precedence, loosest first: `or`, `and`, `not`, then comparisons. So `not a = 1 a
 
 **Literals.** Strings use `'` or `"` and understand `\n`, `\t`, `\r`, `\0`, `\\`, `\'`, `\"` and `\%`. Numbers are decimal with an optional sign, fraction, and exponent.
 
-**Clauses are optional but ordered.** `where` before `order by` before `limit`.
+**Durations** are a number with a unit — `250ms`, `30s`, `15m`, `2h`, `7d` — and evaluate to a number of seconds, so `where ts(t) > now() - 15m` reads as it sounds.
 
-**`select`** takes `*` or a comma-separated field list. `*` emits every field of the record; a field list emits exactly those, in the order you wrote them. A selected field the record does not have becomes an empty cell (and is simply absent in JSON output).
+**Arithmetic** is `+` and `-` between values, left-associative, with parentheses to regroup. Both sides are cast to numbers the way `num` casts them. There is no `*` or `/`: `*` already means "every field" in `select`, and mixing the two spellings in one grammar makes queries harder to read than the gain is worth.
+
+**Clauses are optional but ordered.** `where` before `group by` before `having` before `order by` before `limit`.
+
+**`select`** takes `*` or a comma-separated list of values. `*` emits every field of the record; a list emits exactly those, in the order you wrote them. A selected field the record does not have becomes an empty cell (and is simply absent in JSON output). `as name` renames the column; without it, the column is labelled with the expression exactly as you typed it.
 
 **`where`** takes a boolean expression. A bare field or literal is also a valid condition, evaluated for truthiness — `where cached` and `where not err` are the idiomatic presence tests.
 
