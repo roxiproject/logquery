@@ -3,6 +3,7 @@
 mod ast;
 mod engine;
 mod eval;
+mod group;
 mod lexer;
 mod output;
 mod parser;

@@ -322,7 +322,7 @@ fn text_arg(args: &[ValueExpr], i: usize, record: &Record) -> Option<String> {
 /// Numeric cast. Numbers pass through, booleans become `1`/`0`, and a string is
 /// read as a number with an optional unit suffix, so `"120ms"` is `120` and
 /// `"1.5"` is `1.5`. Anything else is missing.
-fn to_number(v: &Value) -> Option<f64> {
+pub fn to_number(v: &Value) -> Option<f64> {
     match v {
         Value::Number(n) => n.as_f64(),
         Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
