@@ -7,8 +7,29 @@ use std::fmt;
 pub struct Query {
     pub select: Selection,
     pub filter: Option<Expr>,
+    /// `group by level, bucket(ts, 5m)` — the values that define a group. The
+    /// labels are the column headers the group keys are printed under.
+    pub group_by: Vec<SelectItem>,
+    /// `having count(*) > 10` — a filter applied to the grouped rows.
+    pub having: Option<Expr>,
     pub order_by: Option<OrderBy>,
     pub limit: Option<usize>,
+}
+
+impl Query {
+    /// True when the query produces one row per group rather than one row per
+    /// record. Writing an aggregate without `group by` is a single group over
+    /// the whole input, as in SQL.
+    pub fn is_grouped(&self) -> bool {
+        !self.group_by.is_empty() || self.selects_an_aggregate()
+    }
+
+    fn selects_an_aggregate(&self) -> bool {
+        match &self.select {
+            Selection::All => false,
+            Selection::Items(items) => items.iter().any(|i| i.value.has_aggregate()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -209,6 +230,55 @@ impl ArithOp {
     }
 }
 
+/// The aggregate functions. These fold a whole group down to one value, so
+/// unlike a scalar function they can only appear in `select` and `having`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Agg {
+    Count,
+    CountDistinct,
+    Sum,
+    Avg,
+    Min,
+    Max,
+    First,
+    Last,
+}
+
+impl Agg {
+    pub fn parse(name: &str) -> Option<Agg> {
+        match name.to_ascii_lowercase().as_str() {
+            "count" => Some(Agg::Count),
+            "count_distinct" => Some(Agg::CountDistinct),
+            "sum" => Some(Agg::Sum),
+            "avg" | "mean" => Some(Agg::Avg),
+            "min" => Some(Agg::Min),
+            "max" => Some(Agg::Max),
+            "first" => Some(Agg::First),
+            "last" => Some(Agg::Last),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Agg::Count => "count",
+            Agg::CountDistinct => "count_distinct",
+            Agg::Sum => "sum",
+            Agg::Avg => "avg",
+            Agg::Min => "min",
+            Agg::Max => "max",
+            Agg::First => "first",
+            Agg::Last => "last",
+        }
+    }
+
+    /// True when the aggregate accepts `count(*)`, meaning "every record in the
+    /// group" rather than "every record where this value is present".
+    pub fn accepts_star(self) -> bool {
+        matches!(self, Agg::Count)
+    }
+}
+
 /// Something that produces a value: a field, a literal, a call, or a sum.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValueExpr {
@@ -223,6 +293,23 @@ pub enum ValueExpr {
         left: Box<ValueExpr>,
         right: Box<ValueExpr>,
     },
+    /// An aggregate over a group. `arg` is `None` for `count(*)`.
+    Agg {
+        agg: Agg,
+        arg: Option<Box<ValueExpr>>,
+    },
+}
+
+impl ValueExpr {
+    /// True when evaluating this needs a whole group rather than one record.
+    pub fn has_aggregate(&self) -> bool {
+        match self {
+            ValueExpr::Field(_) | ValueExpr::Lit(_) => false,
+            ValueExpr::Agg { .. } => true,
+            ValueExpr::Call { args, .. } => args.iter().any(|a| a.has_aggregate()),
+            ValueExpr::Arith { left, right, .. } => left.has_aggregate() || right.has_aggregate(),
+        }
+    }
 }
 
 impl fmt::Display for ValueExpr {
@@ -243,6 +330,10 @@ impl fmt::Display for ValueExpr {
                 }
                 write!(f, ")")
             }
+            ValueExpr::Agg { agg, arg } => match arg {
+                None => write!(f, "{}(*)", agg.name()),
+                Some(a) => write!(f, "{}({a})", agg.name()),
+            },
             ValueExpr::Arith { op, left, right } => {
                 write!(f, "{left} {} ", op.symbol())?;
                 // `a - (b - c)` differs from `a - b - c`, so a nested sum on

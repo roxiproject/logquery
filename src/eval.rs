@@ -70,6 +70,14 @@ fn resolve<'a>(expr: &'a ValueExpr, record: &'a Record) -> Resolved<'a> {
         ValueExpr::Lit(lit) => Resolved::Owned(literal_value(lit)),
         ValueExpr::Call { func, args } => call(*func, args, record),
         ValueExpr::Arith { op, left, right } => arith(*op, left, right, record),
+        // An aggregate cannot be computed from one record. The engine folds
+        // each group first and stores the result under the aggregate's own
+        // text, so by the time `select` and `having` are evaluated the value
+        // is an ordinary field of the grouped row.
+        ValueExpr::Agg { .. } => match record.get(&expr.to_string()) {
+            Some(v) => Resolved::Owned(v.clone()),
+            None => Resolved::Missing,
+        },
     }
 }
 
