@@ -7,6 +7,7 @@ mod lexer;
 mod output;
 mod parser;
 mod record;
+mod timeutil;
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
