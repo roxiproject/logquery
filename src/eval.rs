@@ -113,6 +113,24 @@ fn call<'a>(func: Func, args: &'a [ValueExpr], record: &'a Record) -> Resolved<'
             }
             return Resolved::Missing;
         }
+        Func::Concat => {
+            // Joins whatever is there. A missing or null argument contributes
+            // nothing, so `concat(level, ": ", msg)` still reads well when one
+            // side is absent. All arguments missing is itself missing.
+            let mut out = String::new();
+            let mut any = false;
+            for a in args {
+                if let Some(t) = resolve(a, record).value().and_then(as_text) {
+                    out.push_str(&t);
+                    any = true;
+                }
+            }
+            return if any {
+                Resolved::Owned(Value::String(out))
+            } else {
+                Resolved::Missing
+            };
+        }
         _ => {}
     }
 
@@ -131,6 +149,33 @@ fn call<'a>(func: Func, args: &'a [ValueExpr], record: &'a Record) -> Resolved<'
         },
         Func::Num => to_number(&first).map(number),
         Func::DurationMs => to_duration_ms(&first).map(number),
+        Func::Trim => as_text(&first).map(|t| Value::String(t.trim().to_string())),
+        Func::Contains | Func::StartsWith | Func::EndsWith => {
+            let (Some(hay), Some(needle)) = (as_text(&first), text_arg(args, 1, record)) else {
+                return Resolved::Missing;
+            };
+            Some(Value::Bool(match func {
+                Func::Contains => hay.contains(&needle),
+                Func::StartsWith => hay.starts_with(&needle),
+                _ => hay.ends_with(&needle),
+            }))
+        }
+        Func::Replace => {
+            let (Some(text), Some(from), Some(to)) = (
+                as_text(&first),
+                text_arg(args, 1, record),
+                text_arg(args, 2, record),
+            ) else {
+                return Resolved::Missing;
+            };
+            // Replacing the empty string would splice the replacement between
+            // every character, which is never what a log query means.
+            if from.is_empty() {
+                Some(Value::String(text))
+            } else {
+                Some(Value::String(text.replace(&from, &to)))
+            }
+        }
         Func::Substr => {
             let Some(text) = as_text(&first) else {
                 return Resolved::Missing;
@@ -165,13 +210,19 @@ fn call<'a>(func: Func, args: &'a [ValueExpr], record: &'a Record) -> Resolved<'
             };
             Some(Value::String(chars[begin..end].iter().collect()))
         }
-        Func::Now | Func::Coalesce => unreachable!("handled above"),
+        Func::Now | Func::Coalesce | Func::Concat => unreachable!("handled above"),
     };
 
     match out {
         Some(v) => Resolved::Owned(v),
         None => Resolved::Missing,
     }
+}
+
+/// Reduce argument `i` to text, or `None` when it is absent or has no textual
+/// form.
+fn text_arg(args: &[ValueExpr], i: usize, record: &Record) -> Option<String> {
+    resolve(args.get(i)?, record).value().and_then(as_text)
 }
 
 /// Numeric cast. Numbers pass through, booleans become `1`/`0`, and a string is
@@ -918,6 +969,56 @@ mod tests {
         assert_eq!(value("duration_ms(d)", &r), Some(json!(300.0)));
         assert_eq!(value("duration_ms(e)", &r), Some(json!(300.0)));
         assert_eq!(value("duration_ms(f)", &r), None);
+    }
+
+    #[test]
+    fn trim_strips_surrounding_whitespace() {
+        let r = json!({"s": "  padded \t", "inner": "a b"});
+        assert_eq!(value("trim(s)", &r), Some(json!("padded")));
+        assert_eq!(value("trim(inner)", &r), Some(json!("a b")));
+    }
+
+    #[test]
+    fn substring_predicates_return_booleans() {
+        let r = json!({"msg": "upstream timeout on /v1/users"});
+        assert_eq!(value(r#"contains(msg, "timeout")"#, &r), Some(json!(true)));
+        assert_eq!(value(r#"contains(msg, "Timeout")"#, &r), Some(json!(false)));
+        assert_eq!(value(r#"starts_with(msg, "upstream")"#, &r), Some(json!(true)));
+        assert_eq!(value(r#"ends_with(msg, "/v1/users")"#, &r), Some(json!(true)));
+        assert_eq!(value(r#"ends_with(msg, "upstream")"#, &r), Some(json!(false)));
+        assert_eq!(value(r#"contains(gone, "x")"#, &r), None);
+    }
+
+    #[test]
+    fn substring_predicates_filter_in_where() {
+        let r = json!({"msg": "GET /health 200"});
+        assert!(check(r#"contains(msg, "/health")"#, &r));
+        assert!(check(r#"starts_with(msg, "GET") and ends_with(msg, "200")"#, &r));
+        assert!(!check(r#"contains(msg, "POST")"#, &r));
+    }
+
+    #[test]
+    fn replace_rewrites_every_occurrence() {
+        let r = json!({"path": "/v1/users/12/orders/34"});
+        assert_eq!(
+            value(r#"replace(path, "/", ":")"#, &r),
+            Some(json!(":v1:users:12:orders:34"))
+        );
+        // An empty needle would match everywhere; the text is returned as-is.
+        assert_eq!(value(r#"replace(path, "", "x")"#, &r), Some(json!("/v1/users/12/orders/34")));
+        assert_eq!(value(r#"replace(gone, "a", "b")"#, &r), None);
+    }
+
+    #[test]
+    fn concat_joins_the_arguments_it_has() {
+        let r = json!({"level": "error", "code": 500, "nil": null});
+        assert_eq!(
+            value(r#"concat(level, ": ", code)"#, &r),
+            Some(json!("error: 500"))
+        );
+        // Absent and null pieces contribute nothing rather than voiding the row.
+        assert_eq!(value(r#"concat(gone, level, nil)"#, &r), Some(json!("error")));
+        assert_eq!(value("concat(gone, nil)", &r), None);
     }
 
     #[test]

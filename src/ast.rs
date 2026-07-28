@@ -102,6 +102,12 @@ pub enum Func {
     Now,
     Num,
     DurationMs,
+    Trim,
+    Contains,
+    StartsWith,
+    EndsWith,
+    Replace,
+    Concat,
 }
 
 impl Func {
@@ -115,6 +121,12 @@ impl Func {
             "now" => Some(Func::Now),
             "num" => Some(Func::Num),
             "duration_ms" => Some(Func::DurationMs),
+            "trim" => Some(Func::Trim),
+            "contains" => Some(Func::Contains),
+            "starts_with" => Some(Func::StartsWith),
+            "ends_with" => Some(Func::EndsWith),
+            "replace" => Some(Func::Replace),
+            "concat" => Some(Func::Concat),
             _ => None,
         }
     }
@@ -129,6 +141,12 @@ impl Func {
             Func::Now => "now",
             Func::Num => "num",
             Func::DurationMs => "duration_ms",
+            Func::Trim => "trim",
+            Func::Contains => "contains",
+            Func::StartsWith => "starts_with",
+            Func::EndsWith => "ends_with",
+            Func::Replace => "replace",
+            Func::Concat => "concat",
         }
     }
 
@@ -137,9 +155,13 @@ impl Func {
     pub fn arity(self) -> (usize, Option<usize>) {
         match self {
             Func::Now => (0, Some(0)),
-            Func::Lower | Func::Upper | Func::Len | Func::Num | Func::DurationMs => (1, Some(1)),
+            Func::Lower | Func::Upper | Func::Len | Func::Num | Func::DurationMs | Func::Trim => {
+                (1, Some(1))
+            }
             Func::Substr => (2, Some(3)),
-            Func::Coalesce => (1, None),
+            Func::Contains | Func::StartsWith | Func::EndsWith => (2, Some(2)),
+            Func::Replace => (3, Some(3)),
+            Func::Coalesce | Func::Concat => (1, None),
         }
     }
 }
