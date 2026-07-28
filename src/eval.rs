@@ -111,7 +111,17 @@ fn literal_value(lit: &Literal) -> Value {
 
 /// Wrap an `f64` as a JSON number, or `null` when it is not finite. Nothing
 /// downstream has to worry about a `NaN` sneaking into a record.
-fn number(n: f64) -> Value {
+///
+/// A value with no fractional part is stored as an integer, so `len(msg)`
+/// prints `24` rather than `24.0` and round-trips through JSON output as the
+/// integer a reader expects. The range check keeps the conversion exact:
+/// beyond 2^53 an `f64` no longer represents every integer, so those stay
+/// floating point rather than gaining false precision.
+pub fn number(n: f64) -> Value {
+    const EXACT: f64 = 9_007_199_254_740_992.0; // 2^53
+    if n.fract() == 0.0 && n.abs() <= EXACT {
+        return Value::Number(serde_json::Number::from(n as i64));
+    }
     serde_json::Number::from_f64(n)
         .map(Value::Number)
         .unwrap_or(Value::Null)
@@ -1017,11 +1027,24 @@ mod tests {
     #[test]
     fn len_counts_characters_and_members() {
         let r = json!({"s": "héllo", "arr": [1, 2, 3], "obj": {"a": 1}, "n": 5});
-        assert_eq!(value("len(s)", &r), Some(json!(5.0)));
-        assert_eq!(value("len(arr)", &r), Some(json!(3.0)));
-        assert_eq!(value("len(obj)", &r), Some(json!(1.0)));
+        assert_eq!(value("len(s)", &r), Some(json!(5)));
+        assert_eq!(value("len(arr)", &r), Some(json!(3)));
+        assert_eq!(value("len(obj)", &r), Some(json!(1)));
         assert_eq!(value("len(n)", &r), None);
         assert_eq!(value("len(nope)", &r), None);
+    }
+
+    #[test]
+    fn whole_numbers_keep_their_integer_spelling() {
+        let r = json!({"a": 3, "b": 4, "big": 1e300});
+        // A count of characters is an integer, and prints as one.
+        assert_eq!(value("len('abc')", &r).unwrap().to_string(), "3");
+        assert_eq!(value("a + b", &r).unwrap().to_string(), "7");
+        // A real fraction keeps it.
+        assert_eq!(value("round(2.5, 1)", &r).unwrap().to_string(), "2.5");
+        // Past 2^53 an f64 no longer represents every integer, so the value
+        // stays floating point rather than claiming exactness it lacks.
+        assert!(value("big + 0", &r).unwrap().is_f64());
     }
 
     #[test]
@@ -1061,10 +1084,10 @@ mod tests {
     #[test]
     fn num_casts_to_a_number() {
         let r = json!({"n": 42, "s": "500", "u": "120ms", "b": true, "junk": "error", "arr": []});
-        assert_eq!(value("num(n)", &r), Some(json!(42.0)));
-        assert_eq!(value("num(s)", &r), Some(json!(500.0)));
-        assert_eq!(value("num(u)", &r), Some(json!(120.0)));
-        assert_eq!(value("num(b)", &r), Some(json!(1.0)));
+        assert_eq!(value("num(n)", &r), Some(json!(42)));
+        assert_eq!(value("num(s)", &r), Some(json!(500)));
+        assert_eq!(value("num(u)", &r), Some(json!(120)));
+        assert_eq!(value("num(b)", &r), Some(json!(1)));
         assert_eq!(value("num(junk)", &r), None);
         assert_eq!(value("num(arr)", &r), None);
         assert_eq!(value("num(missing)", &r), None);
@@ -1073,11 +1096,11 @@ mod tests {
     #[test]
     fn duration_ms_normalises_units() {
         let r = json!({"a": "1.5s", "b": "250ms", "c": "2m", "d": 300, "e": "300", "f": "soon"});
-        assert_eq!(value("duration_ms(a)", &r), Some(json!(1500.0)));
-        assert_eq!(value("duration_ms(b)", &r), Some(json!(250.0)));
-        assert_eq!(value("duration_ms(c)", &r), Some(json!(120000.0)));
-        assert_eq!(value("duration_ms(d)", &r), Some(json!(300.0)));
-        assert_eq!(value("duration_ms(e)", &r), Some(json!(300.0)));
+        assert_eq!(value("duration_ms(a)", &r), Some(json!(1500)));
+        assert_eq!(value("duration_ms(b)", &r), Some(json!(250)));
+        assert_eq!(value("duration_ms(c)", &r), Some(json!(120000)));
+        assert_eq!(value("duration_ms(d)", &r), Some(json!(300)));
+        assert_eq!(value("duration_ms(e)", &r), Some(json!(300)));
         assert_eq!(value("duration_ms(f)", &r), None);
     }
 
@@ -1135,12 +1158,12 @@ mod tests {
     fn arithmetic_functions_round_and_truncate() {
         let r = json!({"n": -2.5, "d": 1234.5678, "s": "  42.7 "});
         assert_eq!(value("abs(n)", &r), Some(json!(2.5)));
-        assert_eq!(value("floor(d)", &r), Some(json!(1234.0)));
-        assert_eq!(value("ceil(d)", &r), Some(json!(1235.0)));
-        assert_eq!(value("round(d)", &r), Some(json!(1235.0)));
+        assert_eq!(value("floor(d)", &r), Some(json!(1234)));
+        assert_eq!(value("ceil(d)", &r), Some(json!(1235)));
+        assert_eq!(value("round(d)", &r), Some(json!(1235)));
         assert_eq!(value("round(d, 2)", &r), Some(json!(1234.57)));
         // Text that reads as a number is cast first, as `num` would.
-        assert_eq!(value("round(s)", &r), Some(json!(43.0)));
+        assert_eq!(value("round(s)", &r), Some(json!(43)));
         assert_eq!(value("abs(gone)", &r), None);
     }
 
@@ -1148,7 +1171,7 @@ mod tests {
     fn rounding_places_are_clamped_to_a_usable_range() {
         let r = json!({"d": 1.23456});
         // A negative place count would otherwise scale the value away.
-        assert_eq!(value("round(d, -3)", &r), Some(json!(1.0)));
+        assert_eq!(value("round(d, -3)", &r), Some(json!(1)));
         assert_eq!(value("round(d, 99)", &r), Some(json!(1.23456)));
     }
 
@@ -1161,11 +1184,11 @@ mod tests {
             "millis": 1785146400000i64,
             "junk": "yesterday"
         });
-        assert_eq!(value("ts(text)", &r), Some(json!(1785146400.0)));
+        assert_eq!(value("ts(text)", &r), Some(json!(1785146400)));
         // The same instant written in another zone lands on the same number.
         assert_eq!(value("ts(offset)", &r), value("ts(text)", &r));
-        assert_eq!(value("ts(secs)", &r), Some(json!(1785146400.0)));
-        assert_eq!(value("ts(millis)", &r), Some(json!(1785146400.0)));
+        assert_eq!(value("ts(secs)", &r), Some(json!(1785146400)));
+        assert_eq!(value("ts(millis)", &r), Some(json!(1785146400)));
         assert_eq!(value("ts(junk)", &r), None);
         assert_eq!(value("ts(gone)", &r), None);
     }
@@ -1199,10 +1222,10 @@ mod tests {
     #[test]
     fn sums_and_differences_evaluate() {
         let r = json!({"a": 10, "b": 4, "s": "2.5"});
-        assert_eq!(value("a + b", &r), Some(json!(14.0)));
-        assert_eq!(value("a - b", &r), Some(json!(6.0)));
-        assert_eq!(value("a - b - b", &r), Some(json!(2.0)));
-        assert_eq!(value("a - (b - b)", &r), Some(json!(10.0)));
+        assert_eq!(value("a + b", &r), Some(json!(14)));
+        assert_eq!(value("a - b", &r), Some(json!(6)));
+        assert_eq!(value("a - b - b", &r), Some(json!(2)));
+        assert_eq!(value("a - (b - b)", &r), Some(json!(10)));
         // A numeric string is cast, as `num` casts it.
         assert_eq!(value("a + s", &r), Some(json!(12.5)));
     }
@@ -1210,8 +1233,8 @@ mod tests {
     #[test]
     fn a_duration_literal_is_its_length_in_seconds() {
         let r = json!({});
-        assert_eq!(value("0 + 15m", &r), Some(json!(900.0)));
-        assert_eq!(value("0 + 1h", &r), Some(json!(3600.0)));
+        assert_eq!(value("0 + 15m", &r), Some(json!(900)));
+        assert_eq!(value("0 + 1h", &r), Some(json!(3600)));
         assert_eq!(value("0 + 250ms", &r), Some(json!(0.25)));
     }
 

@@ -265,7 +265,7 @@ impl State {
                     return None;
                 }
                 let out = if agg == Agg::Avg { sum / n as f64 } else { sum };
-                serde_json::Number::from_f64(out).map(Value::Number)
+                Some(crate::eval::number(out))
             }
             State::Extreme(v) | State::Pick(v) => v,
         }
@@ -441,10 +441,10 @@ mod tests {
     fn sum_and_avg_use_the_values_that_are_there() {
         let rows = group("select level, sum(ms), avg(ms) group by level", LOG);
         // info has one value, 10.
-        assert_eq!(rows[0]["sum(ms)"], json!(10.0));
-        assert_eq!(rows[0]["avg(ms)"], json!(10.0));
+        assert_eq!(rows[0]["sum(ms)"], json!(10));
+        assert_eq!(rows[0]["avg(ms)"], json!(10));
         // error has 200, 50 and the string "90", which casts to a number.
-        assert_eq!(rows[1]["sum(ms)"], json!(340.0));
+        assert_eq!(rows[1]["sum(ms)"], json!(340));
         assert_eq!(
             rows[1]["avg(ms)"].as_f64().unwrap(),
             340.0 / 3.0
