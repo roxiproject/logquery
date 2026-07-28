@@ -108,6 +108,10 @@ pub enum Func {
     EndsWith,
     Replace,
     Concat,
+    Abs,
+    Round,
+    Floor,
+    Ceil,
 }
 
 impl Func {
@@ -127,6 +131,10 @@ impl Func {
             "ends_with" => Some(Func::EndsWith),
             "replace" => Some(Func::Replace),
             "concat" => Some(Func::Concat),
+            "abs" => Some(Func::Abs),
+            "round" => Some(Func::Round),
+            "floor" => Some(Func::Floor),
+            "ceil" => Some(Func::Ceil),
             _ => None,
         }
     }
@@ -147,6 +155,10 @@ impl Func {
             Func::EndsWith => "ends_with",
             Func::Replace => "replace",
             Func::Concat => "concat",
+            Func::Abs => "abs",
+            Func::Round => "round",
+            Func::Floor => "floor",
+            Func::Ceil => "ceil",
         }
     }
 
@@ -155,9 +167,12 @@ impl Func {
     pub fn arity(self) -> (usize, Option<usize>) {
         match self {
             Func::Now => (0, Some(0)),
-            Func::Lower | Func::Upper | Func::Len | Func::Num | Func::DurationMs | Func::Trim => {
-                (1, Some(1))
-            }
+            Func::Lower | Func::Upper | Func::Len | Func::Num | Func::DurationMs
+            | Func::Trim
+            | Func::Abs
+            | Func::Floor
+            | Func::Ceil => (1, Some(1)),
+            Func::Round => (1, Some(2)),
             Func::Substr => (2, Some(3)),
             Func::Contains | Func::StartsWith | Func::EndsWith => (2, Some(2)),
             Func::Replace => (3, Some(3)),

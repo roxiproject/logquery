@@ -150,6 +150,24 @@ fn call<'a>(func: Func, args: &'a [ValueExpr], record: &'a Record) -> Resolved<'
         Func::Num => to_number(&first).map(number),
         Func::DurationMs => to_duration_ms(&first).map(number),
         Func::Trim => as_text(&first).map(|t| Value::String(t.trim().to_string())),
+        Func::Abs => to_number(&first).map(|n| number(n.abs())),
+        Func::Floor => to_number(&first).map(|n| number(n.floor())),
+        Func::Ceil => to_number(&first).map(|n| number(n.ceil())),
+        Func::Round => {
+            let Some(n) = to_number(&first) else {
+                return Resolved::Missing;
+            };
+            // The optional second argument is the number of decimal places.
+            let places = match args.get(1) {
+                None => 0.0,
+                Some(arg) => match resolve(arg, record).value().and_then(to_number) {
+                    Some(p) => p.trunc().clamp(0.0, 15.0),
+                    None => return Resolved::Missing,
+                },
+            };
+            let scale = 10f64.powf(places);
+            Some(number((n * scale).round() / scale))
+        }
         Func::Contains | Func::StartsWith | Func::EndsWith => {
             let (Some(hay), Some(needle)) = (as_text(&first), text_arg(args, 1, record)) else {
                 return Resolved::Missing;
@@ -1019,6 +1037,27 @@ mod tests {
         // Absent and null pieces contribute nothing rather than voiding the row.
         assert_eq!(value(r#"concat(gone, level, nil)"#, &r), Some(json!("error")));
         assert_eq!(value("concat(gone, nil)", &r), None);
+    }
+
+    #[test]
+    fn arithmetic_functions_round_and_truncate() {
+        let r = json!({"n": -2.5, "d": 1234.5678, "s": "  42.7 "});
+        assert_eq!(value("abs(n)", &r), Some(json!(2.5)));
+        assert_eq!(value("floor(d)", &r), Some(json!(1234.0)));
+        assert_eq!(value("ceil(d)", &r), Some(json!(1235.0)));
+        assert_eq!(value("round(d)", &r), Some(json!(1235.0)));
+        assert_eq!(value("round(d, 2)", &r), Some(json!(1234.57)));
+        // Text that reads as a number is cast first, as `num` would.
+        assert_eq!(value("round(s)", &r), Some(json!(43.0)));
+        assert_eq!(value("abs(gone)", &r), None);
+    }
+
+    #[test]
+    fn rounding_places_are_clamped_to_a_usable_range() {
+        let r = json!({"d": 1.23456});
+        // A negative place count would otherwise scale the value away.
+        assert_eq!(value("round(d, -3)", &r), Some(json!(1.0)));
+        assert_eq!(value("round(d, 99)", &r), Some(json!(1.23456)));
     }
 
     #[test]
