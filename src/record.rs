@@ -37,6 +37,21 @@ pub fn parse_line(line: &str) -> Option<(Record, Format)> {
     }
 }
 
+/// Turn a plain-text line into a record using a compiled pattern.
+///
+/// Each named capture group becomes a field. Captured text is typed the way a
+/// bare logfmt value is, so a pattern that captures a status code yields a
+/// number and `status >= 500` works without a cast. A line the pattern does
+/// not match yields `None`, and the caller counts it as skipped.
+pub fn parse_with_pattern(line: &str, pattern: &crate::pattern::Pattern) -> Option<Record> {
+    let caps = pattern.captures(line)?;
+    let mut out = Map::new();
+    for (name, text) in caps {
+        out.insert(name, type_bare_value(&text));
+    }
+    Some(out)
+}
+
 /// Parse a logfmt line: whitespace-separated `key=value` pairs.
 ///
 /// * Values may be bare (`level=error`) or double-quoted (`msg="a b"`).
@@ -361,5 +376,36 @@ mod tests {
         // pins the documented behaviour.
         let r = rec(json!({"a": {"b": 1}}));
         assert_eq!(lookup(&r, &["a".into(), "b".into()]), Some(&json!(1)));
+    }
+
+    #[test]
+    fn a_pattern_extracts_named_fields_from_plain_text() {
+        let p = crate::pattern::Pattern::compile(
+            r#"^(?<ip>[0-9.]+) \S+ \S+ \[(?<when>[^\]]+)\] "(?<method>[A-Z]+) (?<path>\S+)[^"]*" (?<status>\d+) (?<bytes>\d+)"#,
+        )
+        .unwrap();
+        let line = r#"10.0.0.7 - - [27/Jul/2026:10:00:00 +0000] "GET /v1/users HTTP/1.1" 503 1274"#;
+        let r = parse_with_pattern(line, &p).unwrap();
+        assert_eq!(r["ip"], json!("10.0.0.7"));
+        assert_eq!(r["method"], json!("GET"));
+        assert_eq!(r["path"], json!("/v1/users"));
+        // Numbers are typed, so `status >= 500` needs no cast.
+        assert_eq!(r["status"], json!(503));
+        assert_eq!(r["bytes"], json!(1274));
+    }
+
+    #[test]
+    fn a_line_the_pattern_does_not_match_is_no_record() {
+        let p = crate::pattern::Pattern::compile(r"^(?<level>[A-Z]+) (?<msg>.+)").unwrap();
+        assert!(parse_with_pattern("ERROR upstream timeout", &p).is_some());
+        assert!(parse_with_pattern("not shaped like that", &p).is_none());
+    }
+
+    #[test]
+    fn a_group_that_did_not_take_part_is_absent() {
+        let p = crate::pattern::Pattern::compile(r"^(?<a>x)|(?<b>y)$").unwrap();
+        let r = parse_with_pattern("y", &p).unwrap();
+        assert!(!r.contains_key("a"));
+        assert_eq!(r["b"], json!("y"));
     }
 }
