@@ -151,6 +151,28 @@ fn call<'a>(func: Func, args: &'a [ValueExpr], record: &'a Record) -> Resolved<'
         Func::DurationMs => to_duration_ms(&first).map(number),
         Func::Trim => as_text(&first).map(|t| Value::String(t.trim().to_string())),
         Func::Abs => to_number(&first).map(|n| number(n.abs())),
+        Func::Ts => to_epoch(&first).map(number),
+        Func::FormatTime => {
+            let Some(secs) = to_epoch(&first) else {
+                return Resolved::Missing;
+            };
+            // The optional second argument names the zone. Anything that is
+            // not a recognised zone is a value the query cannot honour, so the
+            // result is missing rather than silently rendered as UTC.
+            let offset = match args.get(1) {
+                None => 0,
+                Some(arg) => {
+                    let Some(spec) = resolve(arg, record).value().and_then(as_text) else {
+                        return Resolved::Missing;
+                    };
+                    match timeutil::parse_tz(&spec) {
+                        Some(o) => o,
+                        None => return Resolved::Missing,
+                    }
+                }
+            };
+            Some(Value::String(timeutil::format_epoch(secs, offset)))
+        }
         Func::Floor => to_number(&first).map(|n| number(n.floor())),
         Func::Ceil => to_number(&first).map(|n| number(n.ceil())),
         Func::Round => {
@@ -234,6 +256,32 @@ fn call<'a>(func: Func, args: &'a [ValueExpr], record: &'a Record) -> Resolved<'
     match out {
         Some(v) => Resolved::Owned(v),
         None => Resolved::Missing,
+    }
+}
+
+/// Timestamp cast to epoch seconds. A number is already epoch seconds, except
+/// that a value large enough to be milliseconds is scaled down — no log is
+/// from the year 33658, so a 13-digit timestamp is milliseconds. Text is read
+/// as RFC 3339.
+fn to_epoch(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64().map(rescale_epoch),
+        Value::String(s) => {
+            let t = s.trim();
+            timeutil::parse_rfc3339(t).or_else(|| parse_number(t).map(rescale_epoch))
+        }
+        _ => None,
+    }
+}
+
+/// Milliseconds since 1970 above this are seconds no calendar cares about.
+const EPOCH_MS_THRESHOLD: f64 = 100_000_000_000.0;
+
+fn rescale_epoch(n: f64) -> f64 {
+    if n.abs() >= EPOCH_MS_THRESHOLD {
+        n / 1000.0
+    } else {
+        n
     }
 }
 
@@ -1058,6 +1106,50 @@ mod tests {
         // A negative place count would otherwise scale the value away.
         assert_eq!(value("round(d, -3)", &r), Some(json!(1.0)));
         assert_eq!(value("round(d, 99)", &r), Some(json!(1.23456)));
+    }
+
+    #[test]
+    fn ts_reads_timestamps_onto_one_scale() {
+        let r = json!({
+            "text": "2026-07-27T10:00:00Z",
+            "offset": "2026-07-27T12:00:00+02:00",
+            "secs": 1785146400,
+            "millis": 1785146400000i64,
+            "junk": "yesterday"
+        });
+        assert_eq!(value("ts(text)", &r), Some(json!(1785146400.0)));
+        // The same instant written in another zone lands on the same number.
+        assert_eq!(value("ts(offset)", &r), value("ts(text)", &r));
+        assert_eq!(value("ts(secs)", &r), Some(json!(1785146400.0)));
+        assert_eq!(value("ts(millis)", &r), Some(json!(1785146400.0)));
+        assert_eq!(value("ts(junk)", &r), None);
+        assert_eq!(value("ts(gone)", &r), None);
+    }
+
+    #[test]
+    fn format_time_renders_in_the_named_zone() {
+        let r = json!({"ts": "2026-07-27T10:00:00Z"});
+        assert_eq!(
+            value("format_time(ts)", &r),
+            Some(json!("2026-07-27T10:00:00Z"))
+        );
+        assert_eq!(
+            value(r#"format_time(ts, "+02:00")"#, &r),
+            Some(json!("2026-07-27T12:00:00+02:00"))
+        );
+        assert_eq!(
+            value(r#"format_time(ts, "utc")"#, &r),
+            Some(json!("2026-07-27T10:00:00Z"))
+        );
+        // A zone nobody can resolve is missing, not a quiet fallback to UTC.
+        assert_eq!(value(r#"format_time(ts, "Mars/Olympus")"#, &r), None);
+    }
+
+    #[test]
+    fn timestamps_compare_across_representations() {
+        let r = json!({"ts": "2026-07-27T10:00:00Z", "seen": 1785146460});
+        assert!(check("ts(seen) > ts(ts)", &r));
+        assert!(check("ts(ts) < now()", &r));
     }
 
     #[test]

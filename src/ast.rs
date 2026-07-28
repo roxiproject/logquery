@@ -112,6 +112,8 @@ pub enum Func {
     Round,
     Floor,
     Ceil,
+    Ts,
+    FormatTime,
 }
 
 impl Func {
@@ -135,6 +137,8 @@ impl Func {
             "round" => Some(Func::Round),
             "floor" => Some(Func::Floor),
             "ceil" => Some(Func::Ceil),
+            "ts" => Some(Func::Ts),
+            "format_time" => Some(Func::FormatTime),
             _ => None,
         }
     }
@@ -159,6 +163,8 @@ impl Func {
             Func::Round => "round",
             Func::Floor => "floor",
             Func::Ceil => "ceil",
+            Func::Ts => "ts",
+            Func::FormatTime => "format_time",
         }
     }
 
@@ -171,7 +177,9 @@ impl Func {
             | Func::Trim
             | Func::Abs
             | Func::Floor
-            | Func::Ceil => (1, Some(1)),
+            | Func::Ceil
+            | Func::Ts => (1, Some(1)),
+            Func::FormatTime => (1, Some(2)),
             Func::Round => (1, Some(2)),
             Func::Substr => (2, Some(3)),
             Func::Contains | Func::StartsWith | Func::EndsWith => (2, Some(2)),
