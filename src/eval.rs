@@ -37,8 +37,9 @@ use std::cmp::Ordering;
 
 use serde_json::Value;
 
-use crate::ast::{CmpOp, Expr, Literal, Operand};
+use crate::ast::{CmpOp, Expr, Func, Literal, ValueExpr};
 use crate::record::{lookup, Record};
+use crate::timeutil;
 
 /// The result of resolving an operand against a record.
 #[derive(Debug, Clone, PartialEq)]
@@ -60,20 +61,155 @@ impl Resolved<'_> {
     }
 }
 
-fn resolve<'a>(operand: &'a Operand, record: &'a Record) -> Resolved<'a> {
-    match operand {
-        Operand::Field(path) => match lookup(record, &path.segments) {
+fn resolve<'a>(expr: &'a ValueExpr, record: &'a Record) -> Resolved<'a> {
+    match expr {
+        ValueExpr::Field(path) => match lookup(record, &path.segments) {
             Some(v) => Resolved::Val(v),
             None => Resolved::Missing,
         },
-        Operand::Lit(lit) => Resolved::Owned(match lit {
-            Literal::Str(s) => Value::String(s.clone()),
-            Literal::Num(n) => serde_json::Number::from_f64(*n)
-                .map(Value::Number)
-                .unwrap_or(Value::Null),
-            Literal::Bool(b) => Value::Bool(*b),
-            Literal::Null => Value::Null,
-        }),
+        ValueExpr::Lit(lit) => Resolved::Owned(literal_value(lit)),
+        ValueExpr::Call { func, args } => call(*func, args, record),
+    }
+}
+
+fn literal_value(lit: &Literal) -> Value {
+    match lit {
+        Literal::Str(s) => Value::String(s.clone()),
+        Literal::Num(n) => number(*n),
+        Literal::Bool(b) => Value::Bool(*b),
+        Literal::Null => Value::Null,
+    }
+}
+
+/// Wrap an `f64` as a JSON number, or `null` when it is not finite. Nothing
+/// downstream has to worry about a `NaN` sneaking into a record.
+fn number(n: f64) -> Value {
+    serde_json::Number::from_f64(n)
+        .map(Value::Number)
+        .unwrap_or(Value::Null)
+}
+
+/// Evaluate a value expression against a record.
+///
+/// `None` means the value is *missing* — a path that did not resolve, or a
+/// function whose input was not of a usable shape. Missing propagates: a
+/// function of a missing value is missing, and so a comparison against it is
+/// false rather than an error.
+pub fn eval_value(expr: &ValueExpr, record: &Record) -> Option<Value> {
+    resolve(expr, record).value().cloned()
+}
+
+/// Apply a scalar function.
+fn call<'a>(func: Func, args: &'a [ValueExpr], record: &'a Record) -> Resolved<'a> {
+    // `coalesce` and `now` do not want their arguments reduced up front.
+    match func {
+        Func::Now => return Resolved::Owned(number(timeutil::now_epoch())),
+        Func::Coalesce => {
+            for a in args {
+                let r = resolve(a, record);
+                if !matches!(r.value(), None | Some(Value::Null)) {
+                    return r;
+                }
+            }
+            return Resolved::Missing;
+        }
+        _ => {}
+    }
+
+    let Some(first) = resolve(&args[0], record).value().cloned() else {
+        return Resolved::Missing;
+    };
+
+    let out = match func {
+        Func::Lower => as_text(&first).map(|t| Value::String(t.to_lowercase())),
+        Func::Upper => as_text(&first).map(|t| Value::String(t.to_uppercase())),
+        Func::Len => match &first {
+            Value::String(s) => Some(number(s.chars().count() as f64)),
+            Value::Array(a) => Some(number(a.len() as f64)),
+            Value::Object(o) => Some(number(o.len() as f64)),
+            _ => None,
+        },
+        Func::Num => to_number(&first).map(number),
+        Func::DurationMs => to_duration_ms(&first).map(number),
+        Func::Substr => {
+            let Some(text) = as_text(&first) else {
+                return Resolved::Missing;
+            };
+            let chars: Vec<char> = text.chars().collect();
+            let start = resolve(&args[1], record)
+                .value()
+                .and_then(to_number)
+                .map(|n| n.trunc());
+            let Some(start) = start else {
+                return Resolved::Missing;
+            };
+            // A negative start counts back from the end, as in most scripting
+            // languages; indices are 0-based.
+            let begin = if start < 0.0 {
+                (chars.len() as f64 + start).max(0.0) as usize
+            } else {
+                (start as usize).min(chars.len())
+            };
+            let end = match args.get(2) {
+                None => chars.len(),
+                Some(arg) => {
+                    let Some(len) = resolve(arg, record).value().and_then(to_number) else {
+                        return Resolved::Missing;
+                    };
+                    if len <= 0.0 {
+                        begin
+                    } else {
+                        (begin + len.trunc() as usize).min(chars.len())
+                    }
+                }
+            };
+            Some(Value::String(chars[begin..end].iter().collect()))
+        }
+        Func::Now | Func::Coalesce => unreachable!("handled above"),
+    };
+
+    match out {
+        Some(v) => Resolved::Owned(v),
+        None => Resolved::Missing,
+    }
+}
+
+/// Numeric cast. Numbers pass through, booleans become `1`/`0`, and a string is
+/// read as a number with an optional unit suffix, so `"120ms"` is `120` and
+/// `"1.5"` is `1.5`. Anything else is missing.
+fn to_number(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+        Value::String(s) => {
+            let t = s.trim();
+            if let Some(n) = parse_number(t) {
+                return Some(n);
+            }
+            // Strip a trailing unit: `120ms`, `4.5s`, `12KB`.
+            let head: String = t
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
+                .collect();
+            parse_number(&head)
+        }
+        _ => None,
+    }
+}
+
+/// Duration cast to milliseconds. A bare number is already milliseconds, and a
+/// string carrying a unit is converted: `"1.5s"` is `1500`, `"2m"` is `120000`.
+fn to_duration_ms(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => {
+            let t = s.trim();
+            if let Some(n) = parse_number(t) {
+                return Some(n);
+            }
+            timeutil::parse_duration(t).map(|secs| secs * 1000.0)
+        }
+        _ => None,
     }
 }
 
@@ -696,6 +832,114 @@ mod tests {
         let r = json!({"items": [{"id": 1}, {"id": 2}]});
         assert!(check("items.1.id = 2", &r));
         assert!(!check("items.5.id = 2", &r));
+    }
+
+    // --- scalar functions -------------------------------------------------
+
+    fn value(expr: &str, record: &Value) -> Option<Value> {
+        let e = parse_expr(expr).unwrap();
+        match e {
+            Expr::Truthy(v) => eval_value(&v, &rec(record.clone())),
+            other => panic!("expected a bare value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_and_upper_change_case() {
+        let r = json!({"level": "Error", "code": 500});
+        assert_eq!(value("lower(level)", &r), Some(json!("error")));
+        assert_eq!(value("upper(level)", &r), Some(json!("ERROR")));
+        // Numbers are rendered as text first.
+        assert_eq!(value("upper(code)", &r), Some(json!("500")));
+    }
+
+    #[test]
+    fn len_counts_characters_and_members() {
+        let r = json!({"s": "héllo", "arr": [1, 2, 3], "obj": {"a": 1}, "n": 5});
+        assert_eq!(value("len(s)", &r), Some(json!(5.0)));
+        assert_eq!(value("len(arr)", &r), Some(json!(3.0)));
+        assert_eq!(value("len(obj)", &r), Some(json!(1.0)));
+        assert_eq!(value("len(n)", &r), None);
+        assert_eq!(value("len(nope)", &r), None);
+    }
+
+    #[test]
+    fn substr_slices_by_character() {
+        let r = json!({"s": "connection timeout", "u": "日本語ログ"});
+        assert_eq!(value("substr(s, 0, 10)", &r), Some(json!("connection")));
+        assert_eq!(value("substr(s, 11)", &r), Some(json!("timeout")));
+        assert_eq!(value("substr(u, 0, 3)", &r), Some(json!("日本語")));
+        // Past the end is clamped, not an error.
+        assert_eq!(value("substr(s, 5, 999)", &r), Some(json!("ction timeout")));
+        assert_eq!(value("substr(s, 99, 3)", &r), Some(json!("")));
+        assert_eq!(value("substr(s, 0, 0)", &r), Some(json!("")));
+    }
+
+    #[test]
+    fn substr_counts_a_negative_start_from_the_end() {
+        let r = json!({"s": "abcdef"});
+        assert_eq!(value("substr(s, -2)", &r), Some(json!("ef")));
+        assert_eq!(value("substr(s, -99)", &r), Some(json!("abcdef")));
+    }
+
+    #[test]
+    fn coalesce_takes_the_first_present_value() {
+        let r = json!({"a": null, "b": "", "c": "x"});
+        assert_eq!(value(r#"coalesce(missing, a, b, c)"#, &r), Some(json!("")));
+        assert_eq!(value(r#"coalesce(missing, a, c)"#, &r), Some(json!("x")));
+        assert_eq!(value(r#"coalesce(missing, a)"#, &r), None);
+        assert_eq!(value(r#"coalesce(missing, "fallback")"#, &r), Some(json!("fallback")));
+    }
+
+    #[test]
+    fn now_returns_epoch_seconds() {
+        let v = value("now()", &json!({})).unwrap();
+        assert!(v.as_f64().unwrap() > 1_767_225_600.0);
+    }
+
+    #[test]
+    fn num_casts_to_a_number() {
+        let r = json!({"n": 42, "s": "500", "u": "120ms", "b": true, "junk": "error", "arr": []});
+        assert_eq!(value("num(n)", &r), Some(json!(42.0)));
+        assert_eq!(value("num(s)", &r), Some(json!(500.0)));
+        assert_eq!(value("num(u)", &r), Some(json!(120.0)));
+        assert_eq!(value("num(b)", &r), Some(json!(1.0)));
+        assert_eq!(value("num(junk)", &r), None);
+        assert_eq!(value("num(arr)", &r), None);
+        assert_eq!(value("num(missing)", &r), None);
+    }
+
+    #[test]
+    fn duration_ms_normalises_units() {
+        let r = json!({"a": "1.5s", "b": "250ms", "c": "2m", "d": 300, "e": "300", "f": "soon"});
+        assert_eq!(value("duration_ms(a)", &r), Some(json!(1500.0)));
+        assert_eq!(value("duration_ms(b)", &r), Some(json!(250.0)));
+        assert_eq!(value("duration_ms(c)", &r), Some(json!(120000.0)));
+        assert_eq!(value("duration_ms(d)", &r), Some(json!(300.0)));
+        assert_eq!(value("duration_ms(e)", &r), Some(json!(300.0)));
+        assert_eq!(value("duration_ms(f)", &r), None);
+    }
+
+    #[test]
+    fn a_function_of_a_missing_value_is_missing() {
+        let r = json!({"nil": null});
+        for expr in ["lower(gone)", "upper(gone)", "len(gone)", "substr(gone, 1)", "num(gone)"] {
+            assert_eq!(value(expr, &r), None, "{expr}");
+        }
+        // A present null is not text either.
+        assert_eq!(value("lower(nil)", &r), None);
+    }
+
+    #[test]
+    fn functions_compose_and_compare() {
+        let r = json!({"level": "ERROR", "msg": "Upstream Timeout", "dur": "1.5s"});
+        assert!(check(r#"lower(level) = "error""#, &r));
+        assert!(check(r#"lower(substr(msg, 0, 8)) = "upstream""#, &r));
+        assert!(check("duration_ms(dur) > 1000", &r));
+        assert!(check("len(level) = 5", &r));
+        // Missing propagates into the comparison, which is then false.
+        assert!(!check("len(gone) = 5", &r));
+        assert!(!check("len(gone) != 5", &r));
     }
 
     // --- compare_values directly -----------------------------------------
