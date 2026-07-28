@@ -408,6 +408,12 @@ cargo test
 
 The suite covers the tokenizer, the parser (including precedence and every parse error path), expression evaluation for every operator, the coercion edge cases documented above, dotted and indexed path access, logfmt parsing with quoted values and escapes, the scalar and aggregate functions, the grouping fold and its plan rewrite, time bucketing and formatting, the pattern matcher, the output writers, argument parsing, and end-to-end queries over in-memory log lines.
 
+## Related projects
+
+- [feedmerge](https://github.com/roxiproject/feedmerge) — feed aggregation + BM25 search
+- [contribution-atlas](https://github.com/roxiproject/contribution-atlas) — renders GitHub contribution calendar as heatmap/SVG
+- [roxiproject](https://github.com/roxiproject/roxiproject) — full project index/profile README
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
