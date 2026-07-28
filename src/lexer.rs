@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use crate::timeutil;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     // Keywords. Matched case-insensitively on bare identifiers.
@@ -20,16 +22,23 @@ pub enum TokenKind {
     Or,
     Not,
     Like,
+    Group,
+    Having,
+    As,
 
     /// A field path such as `level` or `user.id`. Stored with its dots intact.
     Ident(String),
     /// A string literal, already unescaped.
     Str(String),
     Num(f64),
+    /// A duration literal such as `15m`, already converted to seconds.
+    Duration(f64),
     Bool(bool),
     Null,
 
     Star,
+    Plus,
+    Minus,
     Comma,
     LParen,
     RParen,
@@ -59,12 +68,18 @@ impl fmt::Display for TokenKind {
             TokenKind::Or => write!(f, "`or`"),
             TokenKind::Not => write!(f, "`not`"),
             TokenKind::Like => write!(f, "`like`"),
+            TokenKind::Group => write!(f, "`group`"),
+            TokenKind::Having => write!(f, "`having`"),
+            TokenKind::As => write!(f, "`as`"),
             TokenKind::Ident(s) => write!(f, "field `{s}`"),
             TokenKind::Str(s) => write!(f, "string \"{s}\""),
             TokenKind::Num(n) => write!(f, "number {n}"),
+            TokenKind::Duration(secs) => write!(f, "duration of {secs}s"),
             TokenKind::Bool(b) => write!(f, "`{b}`"),
             TokenKind::Null => write!(f, "`null`"),
             TokenKind::Star => write!(f, "`*`"),
+            TokenKind::Plus => write!(f, "`+`"),
+            TokenKind::Minus => write!(f, "`-`"),
             TokenKind::Comma => write!(f, "`,`"),
             TokenKind::LParen => write!(f, "`(`"),
             TokenKind::RParen => write!(f, "`)`"),
@@ -243,8 +258,22 @@ impl<'a> Lexer<'a> {
                 }
                 '\'' | '"' => self.lex_string()?,
                 c if c.is_ascii_digit() => self.lex_number()?,
-                '-' | '+' if matches!(self.peek_at(1), Some(d) if d.is_ascii_digit() || d == '.') => {
+                // A sign directly in front of digits is part of the number, but
+                // only where a value can start. After something that ends a
+                // value, `a - 1` is subtraction, not `a` followed by `-1`.
+                '-' | '+'
+                    if !ends_value(out.last())
+                        && matches!(self.peek_at(1), Some(d) if d.is_ascii_digit() || d == '.') =>
+                {
                     self.lex_number()?
+                }
+                '+' => {
+                    self.bump();
+                    TokenKind::Plus
+                }
+                '-' => {
+                    self.bump();
+                    TokenKind::Minus
                 }
                 '.' if matches!(self.peek_at(1), Some(d) if d.is_ascii_digit()) => {
                     self.lex_number()?
@@ -359,9 +388,28 @@ impl<'a> Lexer<'a> {
             }
         }
         let text: String = self.chars[start..self.pos].iter().collect();
-        text.parse::<f64>()
-            .map(TokenKind::Num)
-            .map_err(|_| self.err(format!("invalid number literal `{text}`"), col))
+        let value = text
+            .parse::<f64>()
+            .map_err(|_| self.err(format!("invalid number literal `{text}`"), col))?;
+
+        // A duration unit glued to the number makes it a duration literal:
+        // `15m` is nine hundred seconds, while `15 m` is a number and a field.
+        let unit_start = self.pos;
+        while matches!(self.peek(), Some(c) if c.is_ascii_alphabetic()) {
+            self.bump();
+        }
+        let unit: String = self.chars[unit_start..self.pos].iter().collect();
+        if !unit.is_empty() {
+            if timeutil::is_duration_unit(&unit) {
+                let secs = timeutil::parse_duration(&format!("{text}{unit}")).ok_or_else(|| {
+                    self.err(format!("invalid duration literal `{text}{unit}`"), col)
+                })?;
+                return Ok(TokenKind::Duration(secs));
+            }
+            // Not a duration; hand the letters back so they lex as a field.
+            self.pos = unit_start;
+        }
+        Ok(TokenKind::Num(value))
     }
 
     fn lex_word(&mut self) -> TokenKind {
@@ -382,12 +430,32 @@ impl<'a> Lexer<'a> {
             "or" => TokenKind::Or,
             "not" => TokenKind::Not,
             "like" => TokenKind::Like,
+            "group" => TokenKind::Group,
+            "having" => TokenKind::Having,
+            "as" => TokenKind::As,
             "true" => TokenKind::Bool(true),
             "false" => TokenKind::Bool(false),
             "null" => TokenKind::Null,
             _ => TokenKind::Ident(word),
         }
     }
+}
+
+/// True when the previous token can end a value, which is what decides whether
+/// a following `-` or `+` is an operator or the sign of a literal.
+fn ends_value(prev: Option<&Token>) -> bool {
+    matches!(
+        prev.map(|t| &t.kind),
+        Some(
+            TokenKind::Ident(_)
+                | TokenKind::Str(_)
+                | TokenKind::Num(_)
+                | TokenKind::Duration(_)
+                | TokenKind::Bool(_)
+                | TokenKind::Null
+                | TokenKind::RParen
+        )
+    )
 }
 
 fn is_ident_start(c: char) -> bool {
@@ -481,15 +549,22 @@ mod tests {
     #[test]
     fn lexes_numbers() {
         assert_eq!(
-            kinds("0 12 3.5 -2 +7 1e3 2.5e-2 .5"),
+            kinds("0, 12, 3.5, -2, +7, 1e3, 2.5e-2, .5"),
             vec![
                 TokenKind::Num(0.0),
+                TokenKind::Comma,
                 TokenKind::Num(12.0),
+                TokenKind::Comma,
                 TokenKind::Num(3.5),
+                TokenKind::Comma,
                 TokenKind::Num(-2.0),
+                TokenKind::Comma,
                 TokenKind::Num(7.0),
+                TokenKind::Comma,
                 TokenKind::Num(1000.0),
+                TokenKind::Comma,
                 TokenKind::Num(0.025),
+                TokenKind::Comma,
                 TokenKind::Num(0.5),
                 TokenKind::Eof,
             ]
@@ -501,6 +576,94 @@ mod tests {
         assert_eq!(
             kinds("1e"),
             vec![TokenKind::Num(1.0), TokenKind::Ident("e".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn a_sign_after_a_value_is_an_operator() {
+        assert_eq!(
+            kinds("a - 1 + b"),
+            vec![
+                TokenKind::Ident("a".into()),
+                TokenKind::Minus,
+                TokenKind::Num(1.0),
+                TokenKind::Plus,
+                TokenKind::Ident("b".into()),
+                TokenKind::Eof,
+            ]
+        );
+        // `-` is a legal character inside a field name, so subtraction from a
+        // field needs a space; after `)` it does not.
+        assert_eq!(kinds("a-1"), vec![TokenKind::Ident("a-1".into()), TokenKind::Eof]);
+        assert_eq!(
+            kinds("now()-1h"),
+            vec![
+                TokenKind::Ident("now".into()),
+                TokenKind::LParen,
+                TokenKind::RParen,
+                TokenKind::Minus,
+                TokenKind::Duration(3600.0),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sign_in_front_of_a_value_is_part_of_the_number() {
+        assert_eq!(
+            kinds("(-1)"),
+            vec![
+                TokenKind::LParen,
+                TokenKind::Num(-1.0),
+                TokenKind::RParen,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_duration_literals() {
+        assert_eq!(
+            kinds("250ms 30s 15m 2h 7d 1.5h"),
+            vec![
+                TokenKind::Duration(0.25),
+                TokenKind::Duration(30.0),
+                TokenKind::Duration(900.0),
+                TokenKind::Duration(7200.0),
+                TokenKind::Duration(604_800.0),
+                TokenKind::Duration(5400.0),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_number_with_an_unknown_suffix_is_a_number_and_a_field() {
+        assert_eq!(
+            kinds("30x"),
+            vec![TokenKind::Num(30.0), TokenKind::Ident("x".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn a_space_before_the_unit_means_it_is_not_a_duration() {
+        assert_eq!(
+            kinds("15 m"),
+            vec![TokenKind::Num(15.0), TokenKind::Ident("m".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lexes_the_grouping_keywords() {
+        assert_eq!(
+            kinds("group by having as"),
+            vec![
+                TokenKind::Group,
+                TokenKind::By,
+                TokenKind::Having,
+                TokenKind::As,
+                TokenKind::Eof,
+            ]
         );
     }
 
