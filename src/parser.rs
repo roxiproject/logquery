@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! query      := "select" selection [ "where" expr ]
+//!               [ "group" "by" item { "," item } ] [ "having" expr ]
 //!               [ "order" "by" field [ "asc" | "desc" ] ]
 //!               [ "limit" number ]
 //! selection  := "*" | item { "," item }
@@ -15,8 +16,9 @@
 //! predicate  := primary [ ( cmp_op value ) | ( ["not"] "like" value ) ]
 //! primary    := "(" expr ")" | value
 //! value      := atom { ( "+" | "-" ) atom }
-//! atom       := "(" value ")" | call | field | literal | duration
+//! atom       := "(" value ")" | call | agg | field | literal | duration
 //! call       := name "(" [ value { "," value } ] ")"
+//! agg        := name "(" ( "*" | value ) ")"
 //! ```
 //!
 //! `not` binds tighter than `and`, which binds tighter than `or`. Comparisons
@@ -24,7 +26,7 @@
 //! `(not (a = 1)) and (b = 2)`.
 
 use crate::ast::{
-    ArithOp, CmpOp, Expr, Func, Literal, OrderBy, Path, Query, SelectItem, Selection, ValueExpr,
+    Agg, ArithOp, CmpOp, Expr, Func, Literal, OrderBy, Path, Query, SelectItem, Selection, ValueExpr,
 };
 use crate::lexer::{tokenize, QueryError, Token, TokenKind};
 
@@ -64,6 +66,17 @@ fn describe_arity(min: usize, max: Option<usize>) -> String {
         Some(m) if m == min => format!("{min} {}", plural(min)),
         Some(m) => format!("{min} to {m} arguments"),
         None => format!("at least {min} {}", plural(min)),
+    }
+}
+
+/// True when any leaf of the expression is an aggregate.
+fn expr_has_aggregate(e: &Expr) -> bool {
+    match e {
+        Expr::Or(a, b) | Expr::And(a, b) => expr_has_aggregate(a) || expr_has_aggregate(b),
+        Expr::Not(a) => expr_has_aggregate(a),
+        Expr::Compare { left, right, .. } => left.has_aggregate() || right.has_aggregate(),
+        Expr::Like { left, pattern, .. } => left.has_aggregate() || pattern.has_aggregate(),
+        Expr::Truthy(v) => v.has_aggregate(),
     }
 }
 
@@ -124,9 +137,35 @@ impl Parser<'_> {
 
     fn parse_query(&mut self) -> Result<Query, QueryError> {
         self.expect(TokenKind::Select, "`select` at the start of the query")?;
-        let select = self.parse_selection()?;
+        let select_col = self.peek().col;
+        let (select, item_cols) = self.parse_selection()?;
 
+        let filter_col = self.peek().col;
         let filter = if self.eat(&TokenKind::Where) {
+            let e = self.parse_expr()?;
+            if expr_has_aggregate(&e) {
+                return Err(QueryError::new(
+                    "an aggregate cannot appear in `where`; `where` runs before the groups are \
+                     formed, so use `having` instead",
+                    filter_col,
+                    self.src,
+                ));
+            }
+            Some(e)
+        } else {
+            None
+        };
+
+        let mut group_by = Vec::new();
+        if self.eat(&TokenKind::Group) {
+            self.expect(TokenKind::By, "`by` after `group`")?;
+            group_by.push(self.parse_select_item("a field name or a function after `group by`")?);
+            while self.eat(&TokenKind::Comma) {
+                group_by.push(self.parse_select_item("a field name or a function after `,`")?);
+            }
+        }
+
+        let having = if self.eat(&TokenKind::Having) {
             Some(self.parse_expr()?)
         } else {
             None
@@ -169,23 +208,68 @@ impl Parser<'_> {
             None
         };
 
-        Ok(Query {
+        let query = Query {
             select,
             filter,
+            group_by,
+            having,
             order_by,
             limit,
-        })
+        };
+        self.check_grouping(&query, select_col, &item_cols)?;
+        Ok(query)
     }
 
-    fn parse_selection(&mut self) -> Result<Selection, QueryError> {
-        if self.eat(&TokenKind::Star) {
-            return Ok(Selection::All);
+    /// A grouped query may only select its group keys and aggregates of them.
+    /// Anything else would have to pick one record's value out of the group
+    /// arbitrarily, which is never what the query meant.
+    fn check_grouping(
+        &self,
+        query: &Query,
+        select_col: usize,
+        item_cols: &[usize],
+    ) -> Result<(), QueryError> {
+        if !query.is_grouped() {
+            return Ok(());
         }
-        let mut items = vec![self.parse_select_item("`*`, a field name or a function after `select`")?];
+        let Selection::Items(items) = &query.select else {
+            return Err(QueryError::new(
+                "`select *` cannot be grouped; name the group keys and the aggregates you want",
+                select_col,
+                self.src,
+            ));
+        };
+        for (i, item) in items.iter().enumerate() {
+            if item.value.has_aggregate() || query.group_by.iter().any(|k| k.value == item.value) {
+                continue;
+            }
+            return Err(QueryError::new(
+                format!(
+                    "`{}` is neither a group key nor an aggregate; add it to `group by` or wrap \
+                     it in an aggregate",
+                    item.value
+                ),
+                item_cols.get(i).copied().unwrap_or(select_col),
+                self.src,
+            ));
+        }
+        Ok(())
+    }
+
+    /// The select list, with the column at which each item started so that a
+    /// grouping error can point at the offending entry.
+    fn parse_selection(&mut self) -> Result<(Selection, Vec<usize>), QueryError> {
+        if self.eat(&TokenKind::Star) {
+            return Ok((Selection::All, Vec::new()));
+        }
+        let mut cols = vec![self.peek().col];
+        let mut items =
+            vec![self.parse_select_item("`*`, a field name or a function after `select`")?];
         while self.eat(&TokenKind::Comma) {
+            cols.push(self.peek().col);
             items.push(self.parse_select_item("a field name or a function after `,`")?);
         }
-        Ok(Selection::Items(items))
+        Ok((Selection::Items(items), cols))
     }
 
     /// One select entry, with an optional `as` alias. Without an alias the
@@ -359,6 +443,9 @@ impl Parser<'_> {
     }
 
     fn parse_call(&mut self, name: String, col: usize) -> Result<ValueExpr, QueryError> {
+        if let Some(agg) = Agg::parse(&name) {
+            return self.parse_agg(agg, col);
+        }
         let Some(func) = Func::parse(&name) else {
             return Err(QueryError::new(
                 format!("unknown function `{name}`"),
@@ -394,6 +481,35 @@ impl Parser<'_> {
             ));
         }
         Ok(ValueExpr::Call { func, args })
+    }
+
+    /// An aggregate call. Every aggregate takes exactly one argument, and
+    /// `count` also accepts `*` to mean "every record in the group".
+    fn parse_agg(&mut self, agg: Agg, col: usize) -> Result<ValueExpr, QueryError> {
+        self.bump(); // name
+        self.bump(); // `(`
+        let arg = if self.eat(&TokenKind::Star) {
+            if !agg.accepts_star() {
+                return Err(QueryError::new(
+                    format!("`{}(*)` is not meaningful; give it a value to fold", agg.name()),
+                    col,
+                    self.src,
+                ));
+            }
+            None
+        } else {
+            let value = self.parse_value("a value or `*` inside the aggregate")?;
+            if value.has_aggregate() {
+                return Err(QueryError::new(
+                    "aggregates do not nest".to_string(),
+                    col,
+                    self.src,
+                ));
+            }
+            Some(Box::new(value))
+        };
+        self.expect(TokenKind::RParen, "`)` to close the aggregate")?;
+        Ok(ValueExpr::Agg { agg, arg })
     }
 }
 
@@ -597,6 +713,101 @@ mod tests {
     fn a_dangling_arithmetic_operator_is_an_error() {
         let err = parse("select a +").unwrap_err();
         assert!(err.message.contains("value after the operator"), "{}", err.message);
+    }
+
+    #[test]
+    fn parses_group_by_and_having() {
+        let q = parse("select level, count(*) group by level having count(*) > 10").unwrap();
+        assert!(q.is_grouped());
+        assert_eq!(q.group_by.len(), 1);
+        assert_eq!(q.group_by[0].value, field("level"));
+        assert_eq!(labels(&q), vec!["level", "count(*)"]);
+        assert_eq!(
+            values(&q)[1],
+            ValueExpr::Agg {
+                agg: Agg::Count,
+                arg: None
+            }
+        );
+        assert!(q.having.is_some());
+    }
+
+    #[test]
+    fn an_aggregate_without_group_by_is_one_group() {
+        let q = parse("select count(*), max(duration_ms)").unwrap();
+        assert!(q.is_grouped());
+        assert!(q.group_by.is_empty());
+    }
+
+    #[test]
+    fn a_plain_query_is_not_grouped() {
+        assert!(!parse("select level, msg where level = \"error\"").unwrap().is_grouped());
+        assert!(!parse("select *").unwrap().is_grouped());
+    }
+
+    #[test]
+    fn aggregates_take_one_value_and_count_also_takes_star() {
+        let q = parse("select sum(duration_ms), count(user.id)").unwrap();
+        assert_eq!(
+            values(&q),
+            vec![
+                ValueExpr::Agg {
+                    agg: Agg::Sum,
+                    arg: Some(Box::new(field("duration_ms")))
+                },
+                ValueExpr::Agg {
+                    agg: Agg::Count,
+                    arg: Some(Box::new(field("user.id")))
+                },
+            ]
+        );
+        assert_eq!(labels(&q), vec!["sum(duration_ms)", "count(user.id)"]);
+    }
+
+    #[test]
+    fn only_count_accepts_a_star() {
+        let err = parse("select sum(*)").unwrap_err();
+        assert!(err.message.contains("not meaningful"), "{}", err.message);
+    }
+
+    #[test]
+    fn aggregates_do_not_nest() {
+        let err = parse("select sum(count(x))").unwrap_err();
+        assert!(err.message.contains("do not nest"), "{}", err.message);
+    }
+
+    #[test]
+    fn an_aggregate_in_where_is_an_error() {
+        let err = parse("select level, count(*) where count(*) > 1 group by level").unwrap_err();
+        assert!(err.message.contains("`having`"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_selected_field_must_be_a_group_key_or_an_aggregate() {
+        let err = parse("select level, msg, count(*) group by level").unwrap_err();
+        assert!(err.message.contains("neither a group key"), "{}", err.message);
+        assert_eq!(err.col, 15);
+        // Repeating the key is fine, and so is an aggregate of anything.
+        assert!(parse("select level, count(msg) group by level").is_ok());
+    }
+
+    #[test]
+    fn select_star_cannot_be_grouped() {
+        let err = parse("select * group by level").unwrap_err();
+        assert!(err.message.contains("cannot be grouped"), "{}", err.message);
+    }
+
+    #[test]
+    fn group_by_accepts_an_expression_with_an_alias() {
+        let q = parse("select lower(level) as lvl, count(*) group by lower(level)").unwrap();
+        assert_eq!(labels(&q), vec!["lvl", "count(*)"]);
+        assert_eq!(q.group_by[0].label, "lower(level)");
+    }
+
+    #[test]
+    fn group_by_without_by_is_an_error() {
+        let err = parse("select count(*) group level").unwrap_err();
+        assert!(err.message.contains("`by` after `group`"), "{}", err.message);
     }
 
     #[test]
