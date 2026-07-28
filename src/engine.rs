@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use serde_json::{Map, Value};
 
 use crate::ast::{Query, Selection};
-use crate::eval::{compare_values, eval};
+use crate::eval::{compare_values, eval, eval_value};
 use crate::record::{lookup, Record};
 
 /// One output row: the projected subset of a record.
@@ -40,7 +40,7 @@ impl<'q> Engine<'q> {
     pub fn columns(&self) -> Option<Vec<String>> {
         match &self.query.select {
             Selection::All => None,
-            Selection::Fields(fields) => Some(fields.iter().map(|f| f.raw.clone()).collect()),
+            Selection::Items(items) => Some(items.iter().map(|i| i.label.clone()).collect()),
         }
     }
 
@@ -130,13 +130,13 @@ fn compare_sort_keys(a: Option<&Value>, b: Option<&Value>, descending: bool) -> 
 fn project(selection: &Selection, record: &Record) -> Row {
     match selection {
         Selection::All => record.clone(),
-        Selection::Fields(fields) => {
+        Selection::Items(items) => {
             let mut out = Map::new();
-            for f in fields {
-                if let Some(v) = lookup(record, &f.segments) {
-                    out.insert(f.raw.clone(), v.clone());
+            for item in items {
+                if let Some(v) = eval_value(&item.value, record) {
+                    out.insert(item.label.clone(), v);
                 }
-                // A missing field is simply absent from the row. The writers
+                // A missing value is simply absent from the row. The writers
                 // render it as an empty cell.
             }
             out
