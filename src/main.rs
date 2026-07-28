@@ -6,6 +6,7 @@ mod eval;
 mod lexer;
 mod output;
 mod parser;
+mod pattern;
 mod record;
 mod timeutil;
 
