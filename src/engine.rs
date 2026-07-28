@@ -12,10 +12,10 @@ use std::cmp::Ordering;
 
 use serde_json::{Map, Value};
 
-use crate::ast::{Query, Selection};
+use crate::ast::{OrderBy, Query, Selection};
 use crate::eval::{compare_values, eval, eval_value};
-use crate::group::Grouper;
-use crate::record::{lookup, Record};
+use crate::group::{Grouper, Plan};
+use crate::record::Record;
 
 /// One output row: the projected subset of a record.
 pub type Row = Map<String, Value>;
@@ -28,6 +28,8 @@ pub struct Engine<'q> {
     streaming: bool,
     /// Present only for a grouped query.
     grouper: Option<Grouper<'q>>,
+    /// The grouped query's clauses, rewritten to read from the folded rows.
+    plan: Option<Plan>,
 }
 
 impl<'q> Engine<'q> {
@@ -39,6 +41,7 @@ impl<'q> Engine<'q> {
             emitted: 0,
             streaming: !grouped && query.order_by.is_none(),
             grouper: grouped.then(|| Grouper::new(query)),
+            plan: grouped.then(|| Plan::new(query)),
         }
     }
 
@@ -72,7 +75,8 @@ impl<'q> Engine<'q> {
         } else {
             // Keep the sort key alongside the row so ordering can use a field
             // that was not selected.
-            self.buffer.push(row_with_sort_key(row, record, self.query));
+            self.buffer
+                .push(row_with_sort_key(row, record, self.query.order_by.as_ref()));
             None
         }
     }
@@ -85,19 +89,20 @@ impl<'q> Engine<'q> {
     /// Drain the buffered rows, sorted and limited. Empty in streaming mode.
     pub fn finish(&mut self) -> Vec<Row> {
         if let Some(grouper) = self.grouper.take() {
+            let plan = self.plan.take().expect("a grouped engine has a plan");
             self.buffer = grouper
                 .finish()
                 .into_iter()
-                .filter(|group| match &self.query.having {
+                .filter(|group| match &plan.having {
                     Some(cond) => eval(cond, group),
                     None => true,
                 })
                 .map(|group| {
-                    let row = project(&self.query.select, &group);
+                    let row = project(&plan.select, &group);
                     // The sort key of a grouped row comes from the group, so
                     // `order by count(*)` can order on a column the select
                     // list did not have to name.
-                    row_with_sort_key(row, &group, self.query)
+                    row_with_sort_key(row, &group, plan.order_by.as_ref())
                 })
                 .collect();
         } else if self.streaming {
@@ -125,8 +130,8 @@ impl<'q> Engine<'q> {
 /// collision with a real log field impossible.
 const SORT_KEY: &str = "\u{0}sort";
 
-fn row_with_sort_key(mut row: Row, record: &Record, query: &Query) -> Row {
-    if let Some(order) = &query.order_by {
+fn row_with_sort_key(mut row: Row, record: &Record, order_by: Option<&OrderBy>) -> Row {
+    if let Some(order) = order_by {
         // The projected row is searched first so that ordering can name an
         // alias the select list introduced. A grouped record then holds its
         // columns — group keys and aggregates alike — under the text they
@@ -480,6 +485,49 @@ mod tests {
             .map(|r| (r["level"].as_str().unwrap(), r["n"].as_u64().unwrap()))
             .collect();
         assert_eq!(got, vec![("INFO", 2), ("ERROR", 3)]);
+    }
+
+    #[test]
+    fn time_window_grouping_counts_per_window() {
+        let lines = [
+            r#"{"ts":"2026-07-27T10:00:10Z","level":"error"}"#,
+            r#"{"ts":"2026-07-27T10:04:59Z","level":"error"}"#,
+            r#"{"ts":"2026-07-27T10:05:00Z","level":"error"}"#,
+            r#"{"ts":"2026-07-27T10:31:00Z","level":"info"}"#,
+        ];
+        let rows = run(
+            "select format_time(bucket(ts, 5m)) as window, count(*) as n \
+             group by bucket(ts, 5m)",
+            &lines,
+        );
+        let got: Vec<(&str, u64)> = rows
+            .iter()
+            .map(|r| (r["window"].as_str().unwrap(), r["n"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("2026-07-27T10:00:00Z", 2),
+                ("2026-07-27T10:05:00Z", 1),
+                ("2026-07-27T10:30:00Z", 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_window_and_a_field_make_a_compound_group() {
+        let lines = [
+            r#"{"ts":"2026-07-27T10:00:10Z","level":"error"}"#,
+            r#"{"ts":"2026-07-27T10:01:10Z","level":"info"}"#,
+            r#"{"ts":"2026-07-27T10:02:10Z","level":"error"}"#,
+        ];
+        let rows = run(
+            "select bucket(ts, 5m), level, count(*) as n group by bucket(ts, 5m), level",
+            &lines,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["n"], json!(2));
+        assert_eq!(rows[0]["level"], json!("error"));
     }
 
     #[test]

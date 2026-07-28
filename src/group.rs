@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
-use crate::ast::{Agg, Query, Selection, ValueExpr};
+use crate::ast::{Agg, Expr, OrderBy, Path, Query, SelectItem, Selection, ValueExpr};
 use crate::eval::{compare_values, eval_value, to_number};
 use crate::record::Record;
 
@@ -67,8 +67,7 @@ fn walk_value(v: &ValueExpr, out: &mut Vec<AggSpec>) {
     }
 }
 
-fn walk_expr(e: &crate::ast::Expr, out: &mut Vec<AggSpec>) {
-    use crate::ast::Expr;
+fn walk_expr(e: &Expr, out: &mut Vec<AggSpec>) {
     match e {
         Expr::Or(a, b) | Expr::And(a, b) => {
             walk_expr(a, out);
@@ -84,6 +83,98 @@ fn walk_expr(e: &crate::ast::Expr, out: &mut Vec<AggSpec>) {
             walk_value(pattern, out);
         }
         Expr::Truthy(v) => walk_value(v, out),
+    }
+}
+
+/// The clauses of a grouped query, rewritten to read from the folded rows.
+///
+/// A group key is stored under the text it was written as, so every mention of
+/// that expression — including one buried inside another call, as in
+/// `format_time(bucket(ts, 5m))` — is rewritten to a plain lookup of that
+/// column. The rewrite happens once per query rather than once per record.
+pub struct Plan {
+    pub select: Selection,
+    pub having: Option<Expr>,
+    pub order_by: Option<OrderBy>,
+}
+
+impl Plan {
+    pub fn new(query: &Query) -> Plan {
+        let keys = &query.group_by;
+        Plan {
+            select: match &query.select {
+                Selection::All => Selection::All,
+                Selection::Items(items) => Selection::Items(
+                    items
+                        .iter()
+                        .map(|i| SelectItem {
+                            value: substitute(&i.value, keys),
+                            label: i.label.clone(),
+                        })
+                        .collect(),
+                ),
+            },
+            having: query.having.as_ref().map(|e| substitute_expr(e, keys)),
+            order_by: query.order_by.as_ref().map(|o| OrderBy {
+                value: substitute(&o.value, keys),
+                descending: o.descending,
+            }),
+        }
+    }
+}
+
+/// Rewrite every mention of a group key as a lookup of the column it was
+/// folded into.
+fn substitute(value: &ValueExpr, keys: &[SelectItem]) -> ValueExpr {
+    let written = value.to_string();
+    if keys.iter().any(|k| k.value == *value) {
+        // A one-segment path whose segment is the whole written text, so the
+        // lookup is by column name rather than by walking dots.
+        return ValueExpr::Field(Path {
+            raw: written.clone(),
+            segments: vec![written],
+        });
+    }
+    match value {
+        ValueExpr::Field(_) | ValueExpr::Lit(_) | ValueExpr::Agg { .. } => value.clone(),
+        ValueExpr::Call { func, args } => ValueExpr::Call {
+            func: *func,
+            args: args.iter().map(|a| substitute(a, keys)).collect(),
+        },
+        ValueExpr::Arith { op, left, right } => ValueExpr::Arith {
+            op: *op,
+            left: Box::new(substitute(left, keys)),
+            right: Box::new(substitute(right, keys)),
+        },
+    }
+}
+
+fn substitute_expr(e: &Expr, keys: &[SelectItem]) -> Expr {
+    match e {
+        Expr::Or(a, b) => Expr::Or(
+            Box::new(substitute_expr(a, keys)),
+            Box::new(substitute_expr(b, keys)),
+        ),
+        Expr::And(a, b) => Expr::And(
+            Box::new(substitute_expr(a, keys)),
+            Box::new(substitute_expr(b, keys)),
+        ),
+        Expr::Not(a) => Expr::Not(Box::new(substitute_expr(a, keys))),
+        Expr::Compare { op, left, right } => Expr::Compare {
+            op: *op,
+            left: substitute(left, keys),
+            right: substitute(right, keys),
+        },
+        Expr::Like {
+            left,
+            pattern,
+            negated,
+        } => Expr::Like {
+            left: substitute(left, keys),
+            pattern: substitute(pattern, keys),
+            negated: *negated,
+        },
+        Expr::Truthy(v) => Expr::Truthy(substitute(v, keys)),
     }
 }
 
@@ -453,6 +544,41 @@ mod tests {
         let rows = group("select level, host, count(*) group by level, host", &lines);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["count(*)"], json!(2));
+    }
+
+    #[test]
+    fn the_plan_rewrites_a_group_key_buried_in_a_call() {
+        let q = parse(
+            "select format_time(bucket(ts, 5m)) as window, count(*) group by bucket(ts, 5m)",
+        )
+        .unwrap();
+        let plan = Plan::new(&q);
+        let Selection::Items(items) = &plan.select else {
+            panic!("expected a select list")
+        };
+        // The inner `bucket(...)` is now a lookup of the folded column.
+        assert_eq!(items[0].value.to_string(), "format_time(bucket(ts, 300s))");
+        match &items[0].value {
+            ValueExpr::Call { args, .. } => assert!(
+                matches!(&args[0], ValueExpr::Field(p) if p.segments.len() == 1),
+                "the key should be a single-segment lookup"
+            ),
+            other => panic!("expected a call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_plan_rewrites_a_group_key_in_having() {
+        let q =
+            parse(r#"select lower(level), count(*) group by lower(level) having lower(level) = "error""#);
+        let q = q.unwrap();
+        let plan = Plan::new(&q);
+        match plan.having.unwrap() {
+            crate::ast::Expr::Compare { left, .. } => {
+                assert!(matches!(left, ValueExpr::Field(p) if p.raw == "lower(level)"))
+            }
+            other => panic!("expected a comparison, got {other:?}"),
+        }
     }
 
     #[test]

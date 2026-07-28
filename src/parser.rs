@@ -69,6 +69,24 @@ fn describe_arity(min: usize, max: Option<usize>) -> String {
     }
 }
 
+/// True when the value has the same result for every record in a group: an
+/// aggregate, a group key, a literal, or anything built out of those. A
+/// function of a group key qualifies, so `format_time(bucket(ts, 5m))` may be
+/// selected when the query groups by `bucket(ts, 5m)`.
+fn is_determined_by_groups(value: &ValueExpr, keys: &[SelectItem]) -> bool {
+    if keys.iter().any(|k| k.value == *value) {
+        return true;
+    }
+    match value {
+        ValueExpr::Agg { .. } | ValueExpr::Lit(_) => true,
+        ValueExpr::Field(_) => false,
+        ValueExpr::Call { args, .. } => args.iter().all(|a| is_determined_by_groups(a, keys)),
+        ValueExpr::Arith { left, right, .. } => {
+            is_determined_by_groups(left, keys) && is_determined_by_groups(right, keys)
+        }
+    }
+}
+
 /// True when any leaf of the expression is an aggregate.
 fn expr_has_aggregate(e: &Expr) -> bool {
     match e {
@@ -240,7 +258,7 @@ impl Parser<'_> {
             ));
         };
         for (i, item) in items.iter().enumerate() {
-            if item.value.has_aggregate() || query.group_by.iter().any(|k| k.value == item.value) {
+            if is_determined_by_groups(&item.value, &query.group_by) {
                 continue;
             }
             return Err(QueryError::new(
@@ -806,6 +824,17 @@ mod tests {
         assert_eq!(err.col, 15);
         // Repeating the key is fine, and so is an aggregate of anything.
         assert!(parse("select level, count(msg) group by level").is_ok());
+    }
+
+    #[test]
+    fn a_function_of_a_group_key_may_be_selected() {
+        assert!(parse(
+            "select format_time(bucket(ts, 5m)) as window, count(*) group by bucket(ts, 5m)"
+        )
+        .is_ok());
+        // The key itself still has to be grouped, though.
+        let err = parse("select format_time(ts), count(*) group by bucket(ts, 5m)").unwrap_err();
+        assert!(err.message.contains("neither a group key"), "{}", err.message);
     }
 
     #[test]
