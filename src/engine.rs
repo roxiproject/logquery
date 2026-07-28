@@ -1,10 +1,12 @@
-//! Query execution: filter, project, order, limit.
+//! Query execution: filter, group, project, order, limit.
 //!
-//! Execution has two modes. Without `order by` the engine is streaming: each
-//! record is filtered and projected as it arrives, and once `limit` rows have
-//! been emitted the engine reports that it is done so the caller can stop
-//! reading. With `order by` the engine has to see every record before it can
-//! sort, so rows are buffered until [`Engine::finish`].
+//! Execution has three modes. The plainest is streaming: each record is
+//! filtered and projected as it arrives, and once `limit` rows have been
+//! emitted the engine reports that it is done so the caller can stop reading.
+//! `order by` has to see every record before it can sort, so rows are buffered
+//! until [`Engine::finish`]. A grouped query folds records into groups as they
+//! arrive and produces its rows only at the end, since no group is complete
+//! until the input is.
 
 use std::cmp::Ordering;
 
@@ -12,6 +14,7 @@ use serde_json::{Map, Value};
 
 use crate::ast::{Query, Selection};
 use crate::eval::{compare_values, eval, eval_value};
+use crate::group::Grouper;
 use crate::record::{lookup, Record};
 
 /// One output row: the projected subset of a record.
@@ -23,15 +26,19 @@ pub struct Engine<'q> {
     buffer: Vec<Row>,
     emitted: usize,
     streaming: bool,
+    /// Present only for a grouped query.
+    grouper: Option<Grouper<'q>>,
 }
 
 impl<'q> Engine<'q> {
     pub fn new(query: &'q Query) -> Self {
+        let grouped = query.is_grouped();
         Engine {
             query,
             buffer: Vec::new(),
             emitted: 0,
-            streaming: query.order_by.is_none(),
+            streaming: !grouped && query.order_by.is_none(),
+            grouper: grouped.then(|| Grouper::new(query)),
         }
     }
 
@@ -54,6 +61,10 @@ impl<'q> Engine<'q> {
                 return None;
             }
         }
+        if let Some(grouper) = &mut self.grouper {
+            grouper.accept(record);
+            return None;
+        }
         let row = project(&self.query.select, record);
         if self.streaming {
             self.emitted += 1;
@@ -73,7 +84,23 @@ impl<'q> Engine<'q> {
 
     /// Drain the buffered rows, sorted and limited. Empty in streaming mode.
     pub fn finish(&mut self) -> Vec<Row> {
-        if self.streaming {
+        if let Some(grouper) = self.grouper.take() {
+            self.buffer = grouper
+                .finish()
+                .into_iter()
+                .filter(|group| match &self.query.having {
+                    Some(cond) => eval(cond, group),
+                    None => true,
+                })
+                .map(|group| {
+                    let row = project(&self.query.select, &group);
+                    // The sort key of a grouped row comes from the group, so
+                    // `order by count(*)` can order on a column the select
+                    // list did not have to name.
+                    row_with_sort_key(row, &group, self.query)
+                })
+                .collect();
+        } else if self.streaming {
             return Vec::new();
         }
         let Some(order) = &self.query.order_by else {
@@ -100,8 +127,16 @@ const SORT_KEY: &str = "\u{0}sort";
 
 fn row_with_sort_key(mut row: Row, record: &Record, query: &Query) -> Row {
     if let Some(order) = &query.order_by {
-        if let Some(v) = lookup(record, &order.path.segments) {
-            row.insert(SORT_KEY.to_string(), v.clone());
+        // The projected row is searched first so that ordering can name an
+        // alias the select list introduced; a grouped record then holds its
+        // columns under their full text, before the dotted path walk.
+        let value = row
+            .get(&order.path.raw)
+            .or_else(|| record.get(&order.path.raw))
+            .or_else(|| lookup(record, &order.path.segments))
+            .cloned();
+        if let Some(v) = value {
+            row.insert(SORT_KEY.to_string(), v);
         }
     }
     row
@@ -133,7 +168,14 @@ fn project(selection: &Selection, record: &Record) -> Row {
         Selection::Items(items) => {
             let mut out = Map::new();
             for item in items {
-                if let Some(v) = eval_value(&item.value, record) {
+                // A group key is stored under the text it was written as, so
+                // look for that before evaluating, which would otherwise walk
+                // a dotted key as a nested path.
+                let value = match record.get(&item.value.to_string()) {
+                    Some(v) => Some(v.clone()),
+                    None => eval_value(&item.value, record),
+                };
+                if let Some(v) = value {
                     out.insert(item.label.clone(), v);
                 }
                 // A missing value is simply absent from the row. The writers
@@ -329,6 +371,95 @@ mod tests {
         );
         let q = parse("select *").unwrap();
         assert_eq!(Engine::new(&q).columns(), None);
+    }
+
+    #[test]
+    fn grouped_query_counts_by_level() {
+        let rows = run("select level, count(*) as n group by level", LOG);
+        assert_eq!(rows.len(), 3);
+        let got: Vec<(&str, u64)> = rows
+            .iter()
+            .map(|r| (r["level"].as_str().unwrap(), r["n"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(got, vec![("info", 2), ("error", 3), ("warn", 1)]);
+    }
+
+    #[test]
+    fn grouped_columns_come_from_the_select_list() {
+        let q = parse("select level, count(*) as n group by level").unwrap();
+        assert_eq!(
+            Engine::new(&q).columns(),
+            Some(vec!["level".to_string(), "n".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_grouped_engine_emits_nothing_until_it_finishes() {
+        let q = parse("select level, count(*) group by level").unwrap();
+        let mut e = Engine::new(&q);
+        let (rec, _) = parse_line(LOG[0]).unwrap();
+        assert!(e.accept(&rec).is_none());
+        assert!(!e.is_done());
+        assert_eq!(e.finish().len(), 1);
+    }
+
+    #[test]
+    fn where_runs_before_the_grouping() {
+        let rows = run(
+            r#"select level, count(*) as n where duration_ms > 10 group by level"#,
+            LOG,
+        );
+        let got: Vec<(&str, u64)> = rows
+            .iter()
+            .map(|r| (r["level"].as_str().unwrap(), r["n"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(got, vec![("error", 2), ("warn", 1), ("info", 1)]);
+    }
+
+    #[test]
+    fn having_filters_whole_groups() {
+        let rows = run("select level, count(*) as n group by level having count(*) > 2", LOG);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["level"], json!("error"));
+    }
+
+    #[test]
+    fn having_can_use_an_aggregate_the_select_list_omits() {
+        let rows = run("select level group by level having max(duration_ms) > 1000", LOG);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["level"], json!("error"));
+        assert_eq!(rows[0].len(), 1);
+    }
+
+    #[test]
+    fn grouped_rows_order_and_limit() {
+        let rows = run(
+            "select level, count(*) as n group by level order by n desc limit 2",
+            LOG,
+        );
+        let got: Vec<&str> = rows.iter().map(|r| r["level"].as_str().unwrap()).collect();
+        assert_eq!(got, vec!["error", "info"]);
+    }
+
+    #[test]
+    fn a_bare_aggregate_folds_the_whole_input_to_one_row() {
+        let rows = run("select count(*) as lines, max(duration_ms) as slowest", LOG);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["lines"], json!(6));
+        assert_eq!(rows[0]["slowest"], json!(1500));
+    }
+
+    #[test]
+    fn grouping_by_a_computed_value_end_to_end() {
+        let rows = run(
+            r#"select upper(level) as level, count(*) as n group by upper(level) having count(*) > 1"#,
+            LOG,
+        );
+        let got: Vec<(&str, u64)> = rows
+            .iter()
+            .map(|r| (r["level"].as_str().unwrap(), r["n"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(got, vec![("INFO", 2), ("ERROR", 3)]);
     }
 
     #[test]
